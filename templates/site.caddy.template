@@ -1,0 +1,5 @@
+# Generic HTTP proxy template
+# Replace SITE_SLUG and TARGET_ORIGIN only in a deployment-owned copy.
+# SITE_SLUG.example.test {
+#     reverse_proxy TARGET_ORIGIN
+# }

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bastion VPN</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111827; --card:#1f2937; --muted:#9ca3af; --text:#f9fafb; --accent:#60a5fa; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; font-family:system-ui, sans-serif; background:radial-gradient(circle at top,#1e3a8a 0,var(--bg) 38rem); color:var(--text); }
+    main { max-width: 40rem; width:min(90vw, 40rem); padding:2rem; }
+    .card { padding:2rem; border:1px solid rgba(255,255,255,.12); border-radius:1.25rem; background:rgba(31,41,55,.9); box-shadow:0 20px 50px rgba(0,0,0,.25); }
+    h1 { margin-top:0; }
+    p { color:var(--muted); line-height:1.6; }
+    code { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Bastion VPN</h1>
+      <p>This public repository contains the generic control plane, templates, and validation tooling only.</p>
+      <p>Deployment-specific sites, gateways, equipment, addresses, credentials, certificates, generated files, and runtime state are supplied outside Git.</p>
+      <p>Open the control panel through the deployment's configured origin.</p>
+    </section>
+  </main>
+</body>
+</html>

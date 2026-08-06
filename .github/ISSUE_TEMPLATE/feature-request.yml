@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a focused capability or operator improvement.
+title: "feat: "
+labels: ["type: feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Operator problem
+      description: Who is affected and what workflow is blocked?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the smallest useful behavior, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Trust-boundary and operational impact
+      description: Explain affected namespaces, credentials, ports, rollback, and failure behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: The proposal can be tested with synthetic data.
+          required: true

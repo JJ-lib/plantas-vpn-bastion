@@ -1,0 +1,89 @@
+# Generic Bastion VPN control plane.
+# Deployment-specific images, origins, networks, sites, and credentials are injected outside Git.
+# Use immutable image references for promotion; never use an unpinned production tag.
+services:
+  panel:
+    image: ${PANEL_IMAGE:?Set PANEL_IMAGE to an immutable image reference}
+    container_name: bastion-panel
+    restart: unless-stopped
+    environment:
+      PANEL_DB: /data/panel.db
+      PROJECT_DIR: /opt/bastion-vpn
+      GUAC_JSON_KEY: ${GUAC_JSON_KEY:?Set GUAC_JSON_KEY outside Git}
+      BASTION_PUBLIC_ORIGIN: ${BASTION_PUBLIC_ORIGIN:-http://127.0.0.1}
+      VALIDATION_DENY_CIDRS: ${VALIDATION_DENY_CIDRS:?Set VALIDATION_DENY_CIDRS outside Git}
+    volumes:
+      - panel_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/libexec/docker/cli-plugins/docker-compose:/usr/libexec/docker/cli-plugins/docker-compose:ro
+      - ${BASTION_PROJECT_ROOT:?Set BASTION_PROJECT_ROOT outside Git}:/opt/bastion-vpn
+    networks:
+      - bastion
+
+  vpn-reconciler:
+    image: ${RECONCILER_IMAGE:?Set RECONCILER_IMAGE to an immutable image reference}
+    container_name: bastion-vpn-reconciler
+    restart: unless-stopped
+    command: ["python", "-m", "vpn_reconciler", "--interval", "30"]
+    environment:
+      PANEL_DB: /data/panel.db
+      PROJECT_DIR: /opt/bastion-vpn
+    volumes:
+      - panel_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/libexec/docker/cli-plugins/docker-compose:/usr/libexec/docker/cli-plugins/docker-compose:ro
+      - ${BASTION_PROJECT_ROOT:?Set BASTION_PROJECT_ROOT outside Git}:/opt/bastion-vpn
+    network_mode: none
+    depends_on:
+      - panel
+
+  guacd:
+    image: ${GUACD_IMAGE:?Set GUACD_IMAGE to an immutable image reference}
+    container_name: bastion-guacd
+    restart: unless-stopped
+    networks:
+      - bastion
+
+  guacamole:
+    build:
+      context: ./guacamole-json-context-fix
+      dockerfile: Dockerfile
+    image: ${GUACAMOLE_IMAGE:?Set GUACAMOLE_IMAGE to an immutable image reference}
+    container_name: bastion-guacamole
+    restart: unless-stopped
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: "4822"
+      JSON_ENABLED: "true"
+      JSON_SECRET_KEY: ${GUAC_JSON_KEY:?Set GUAC_JSON_KEY outside Git}
+    networks:
+      - bastion
+    depends_on:
+      - guacd
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: bastion-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/conf.d:/etc/caddy/conf.d:ro
+      - ./www:/srv/www:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - bastion
+    depends_on:
+      - panel
+
+networks:
+  bastion:
+    name: bastion_net
+
+volumes:
+  caddy_data:
+  caddy_config:
+  panel_data:

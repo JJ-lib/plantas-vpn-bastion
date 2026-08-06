@@ -1,0 +1,16 @@
+[Unit]
+Description=Bastion VPN Docker Compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/bastion-vpn
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/vpnctl up
+ExecStop=/usr/local/bin/vpnctl down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="${BASTION_PROJECT_ROOT:-/opt/bastion-vpn}"
+COMPOSE_FILE_LIST="${BASTION_COMPOSE_FILES:-docker-compose.yml}"
+BUILD_CONTEXT="${BASTION_PROXY_CONTEXT:-images/vpn-proxy}"
+LOCAL_IMAGE_TAG="${BASTION_PROXY_IMAGE_TAG:-bastion-vpn-proxy:local}"
+
+cd "$PROJECT_ROOT"
+
+read -r -a compose_files <<< "$COMPOSE_FILE_LIST"
+compose_args=()
+for file in "${compose_files[@]}"; do
+  [[ -n "$file" ]] && compose_args+=(-f "$file")
+done
+
+usage() {
+  cat <<'EOF'
+Usage: vpnctl <command> [args]
+
+Environment:
+  BASTION_PROJECT_ROOT   Deployment checkout (default: /opt/bastion-vpn)
+  BASTION_COMPOSE_FILES  Space-separated Compose files (default: docker-compose.yml)
+  BASTION_PROXY_CONTEXT   Local image build context (default: images/vpn-proxy)
+  BASTION_PROXY_IMAGE_TAG Local-only image tag for build (default: bastion-vpn-proxy:local)
+
+Commands:
+  up                         Start the declared Compose project without building
+  down                       Stop the declared Compose project
+  restart                    Recreate the declared Compose project without building
+  status                     Show Compose service status
+  ps                         Alias for status
+  logs [service]             Follow recent logs for the project or one service
+  build                      Build the explicitly requested local proxy image
+  config                     Validate and render the declared Compose files
+  services                   List services declared by Compose
+EOF
+}
+
+compose() {
+  docker compose --project-directory "$PROJECT_ROOT" "${compose_args[@]}" "$@"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  up)
+    compose up -d --no-build
+    ;;
+  down)
+    compose down
+    ;;
+  restart)
+    compose up -d --no-build --force-recreate
+    ;;
+  status|ps)
+    compose ps
+    ;;
+  logs)
+    if [[ -n "${2:-}" ]]; then
+      compose logs -f --tail=200 "$2"
+    else
+      compose logs -f --tail=200
+    fi
+    ;;
+  build)
+    docker build -t "$LOCAL_IMAGE_TAG" "$BUILD_CONTEXT"
+    ;;
+  config)
+    compose config
+    ;;
+  services)
+    compose config --services
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    printf 'Unknown command: %s\n' "$cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

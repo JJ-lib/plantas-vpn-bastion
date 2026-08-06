@@ -1,0 +1,19 @@
+name: Spelling
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cspell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: streetsidesoftware/cspell-action@v6
+        with:
+          config: .cspell.json
+          files: '**/*.md'
+          incremental_files_only: false

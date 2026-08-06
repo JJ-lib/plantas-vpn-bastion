@@ -1,0 +1,3 @@
+# Generic Caddy snippets
+
+Site-specific virtual hosts are generated from deployment-only inputs and are not shipped in this repository. Do not add customer domains, internal addresses, equipment names, or generated proxy files here.

@@ -1,0 +1,9 @@
+exclude = [
+  '^https://github.com/juanuto/plantas-vpn-bastion',
+  '^https?://127\\.0\\.0\\.1',
+  '^https?://192\\.0\\.2\\.',
+  '^https?://10\\.',
+  '^https://img\\.shields\\.io',
+]
+max_retries = 2
+retry_wait_time = 2

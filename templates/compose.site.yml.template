@@ -1,0 +1,26 @@
+services:
+  vpn-SITE_SLUG:
+    image: ${VPN_PROXY_IMAGE:?Set VPN_PROXY_IMAGE to an immutable image reference}
+    container_name: vpn-SITE_SLUG
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./configs/SITE_SLUG/openfortivpn.conf:/etc/openfortivpn/config:ro
+      - ./configs/SITE_SLUG/haproxy.cfg:/etc/haproxy/haproxy.cfg:ro
+    environment:
+      VPN_READY_TIMEOUT: "90"
+    networks:
+      - bastion
+    healthcheck:
+      test: ["CMD-SHELL", "ip link show | grep -qE 'ppp[0-9]' && pgrep haproxy >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  bastion:
+    external: true
+    name: vpn_bastion_net

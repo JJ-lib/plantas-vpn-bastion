@@ -1,0 +1,58 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*.ovpn
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.csr
+**/auth.txt
+**/askpass.txt
+**/chap-secrets
+**/ipsec.secrets
+**/secrets/**
+
+# Runtime state and local data
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+*.log
+logs/
+diagnostics/
+backups/
+runtime/
+*.pid
+*.sock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Build and editor output
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+build/
+dist/
+*.egg-info/
+
+# Deployment-only iterations
+staging/
+release-candidates/
+.onboarding-owner

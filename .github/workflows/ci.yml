@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-and-compose:
+    name: Python and Compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: panel-app/requirements.txt
+      - name: Install application dependencies
+        run: python -m pip install --disable-pip-version-check -r panel-app/requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q panel-app tests
+      - name: Run project test runner
+        run: python tests/run_full_suite.py
+      - name: Validate root Compose
+        env:
+          GUAC_JSON_KEY: synthetic-ci-only
+          BASTION_PROJECT_ROOT: /workspace/bastion-vpn
+          BASTION_PUBLIC_ORIGIN: http://127.0.0.1
+          BASTION_ACCESS_CIDRS: 192.0.2.0/24
+          VALIDATION_DENY_CIDRS: 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10
+          PANEL_IMAGE: example.invalid/bastion-panel@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          RECONCILER_IMAGE: example.invalid/bastion-reconciler@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          GUACD_IMAGE: example.invalid/bastion-guacd@sha256:2222222222222222222222222222222222222222222222222222222222222222
+          GUACAMOLE_IMAGE: example.invalid/bastion-guacamole@sha256:3333333333333333333333333333333333333333333333333333333333333333
+        run: docker compose -f docker-compose.yml config --quiet
+      - name: Check clipboard contract
+        run: python guacamole-server/test_clipboard_file_transfer_contract.py

@@ -1,0 +1,15 @@
+{
+    admin off
+    auto_https disable_redirects
+}
+
+:80 {
+    encode gzip zstd
+    import /etc/caddy/conf.d/*.caddy
+    handle /guacamole* {
+        reverse_proxy guacamole:8080
+    }
+    handle {
+        reverse_proxy panel:5000
+    }
+}

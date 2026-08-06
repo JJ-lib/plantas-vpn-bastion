@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible defect without sharing customer data.
+title: "bug: "
+labels: ["type: bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include passwords, VPN profiles, private keys, databases, cookies, raw logs, or customer topology.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or image tag
+      description: Use a commit SHA or non-secret image tag.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic plant names and addresses only.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Safe evidence
+      description: Include redacted state, health, timestamps, and error categories only.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Disclosure check
+      options:
+        - label: I removed secrets, private material, raw logs, and customer-specific topology.
+          required: true

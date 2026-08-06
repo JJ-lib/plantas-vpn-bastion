@@ -1,0 +1,21 @@
+# openfortivpn configuration for SITE_SLUG
+# Rellena los datos reales del proveedor.
+
+host = vpn.proveedor.example
+port = 443
+username = usuario
+# password = CAMBIAR
+
+# Muy recomendado: fijar el certificado del gateway Fortinet.
+# La primera conexión puede mostrar el hash trusted-cert necesario.
+# trusted-cert = SHA256_DEL_CERTIFICADO
+
+# Evitar que una VPN modifique DNS global dentro del contenedor si no lo necesitas.
+set-dns = 0
+pppd-use-peerdns = 0
+
+# Si el proveedor usa realm:
+# realm = nombre_realm
+
+# Si usa SAML/MFA interactivo, habrá que adaptar el flujo:
+# saml-login = 1

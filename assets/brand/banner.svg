@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 420" role="img" aria-labelledby="title desc">
+  <title id="title">Bastión VPN banner</title><desc id="desc">A dark network grid with isolated VPN nodes and the Bastión VPN wordmark.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#020617"/><stop offset="1" stop-color="#0c4a6e"/></linearGradient>
+    <linearGradient id="line" x1="0" x2="1"><stop stop-color="#22d3ee"/><stop offset="1" stop-color="#38bdf8"/></linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#1e3a5f" stroke-width="1" opacity=".45"/></pattern>
+    <filter id="glow"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1600" height="420" rx="28" fill="url(#bg)"/><rect width="1600" height="420" rx="28" fill="url(#grid)"/>
+  <path d="M970 85h150l90 82h190M1050 300h170l80-76h170M1230 84v226" fill="none" stroke="url(#line)" stroke-width="3" opacity=".8"/>
+  <g filter="url(#glow)" fill="#22d3ee"><circle cx="970" cy="85" r="7"/><circle cx="1120" cy="85" r="7"/><circle cx="1210" cy="167" r="7"/><circle cx="1400" cy="167" r="7"/><circle cx="1050" cy="300" r="7"/><circle cx="1220" cy="300" r="7"/><circle cx="1300" cy="224" r="7"/><circle cx="1470" cy="224" r="7"/></g>
+  <g transform="translate(96 90) scale(1.55)"><path d="M48 4 96 22v31c0 29-20 45-48 53C20 98 0 82 0 53V22L48 4Z" fill="#0f172a" stroke="#22d3ee" stroke-width="5"/><path d="M48 29v43M27 51h42" stroke="#e0f2fe" stroke-width="6" stroke-linecap="round"/><circle cx="48" cy="29" r="7" fill="#22d3ee"/><circle cx="27" cy="51" r="7" fill="#38bdf8"/><circle cx="69" cy="51" r="7" fill="#38bdf8"/><circle cx="48" cy="72" r="7" fill="#22d3ee"/></g>
+  <text x="300" y="180" fill="#f8fafc" font-family="Inter,Segoe UI,sans-serif" font-size="76" font-weight="750" letter-spacing="-3">Bastión <tspan fill="#67e8f9">VPN</tspan></text>
+  <text x="306" y="238" fill="#bae6fd" font-family="Inter,Segoe UI,sans-serif" font-size="27" letter-spacing="1">ISOLATED REMOTE ACCESS / EXPLICIT SERVICE PUBLICATION</text>
+  <rect x="306" y="280" width="410" height="3" rx="2" fill="url(#line)"/><text x="306" y="326" fill="#94a3b8" font-family="ui-monospace,SFMono-Regular,monospace" font-size="18">docker · vpn namespaces · haproxy · guacamole</text>
+</svg>

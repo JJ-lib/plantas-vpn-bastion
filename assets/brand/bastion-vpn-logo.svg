@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120" role="img" aria-labelledby="title desc">
+  <title id="title">Bastión VPN logo</title><desc id="desc">A shield and network node mark followed by the words Bastión VPN.</desc>
+  <defs><linearGradient id="cyan" x1="0" x2="1"><stop stop-color="#22d3ee"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs>
+  <g transform="translate(12 12)">
+    <path d="M48 4 96 22v31c0 29-20 45-48 53C20 98 0 82 0 53V22L48 4Z" fill="#0f172a" stroke="url(#cyan)" stroke-width="6"/>
+    <path d="M48 29v43M27 51h42" stroke="#e0f2fe" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="48" cy="29" r="7" fill="#22d3ee"/><circle cx="27" cy="51" r="7" fill="#38bdf8"/><circle cx="69" cy="51" r="7" fill="#38bdf8"/><circle cx="48" cy="72" r="7" fill="#22d3ee"/>
+  </g>
+  <text x="132" y="68" fill="#e2e8f0" font-family="Inter,Segoe UI,sans-serif" font-size="42" font-weight="700" letter-spacing="-1">Bastión <tspan fill="#67e8f9">VPN</tspan></text>
+</svg>

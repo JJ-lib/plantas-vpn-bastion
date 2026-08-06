@@ -1,0 +1,29 @@
+name: Question
+description: Ask how to configure or operate the project safely.
+title: "question: "
+labels: ["type: question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the documentation links in README.md. Never post credentials, profiles, raw logs, or customer topology.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Safe context
+      description: Include version, engine type, synthetic plant slug, and redacted error category.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Disclosure check
+      options:
+        - label: I removed secrets and customer-specific data.
+          required: true
