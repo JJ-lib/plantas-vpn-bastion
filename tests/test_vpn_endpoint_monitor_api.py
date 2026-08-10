@@ -34,6 +34,7 @@ class EndpointMonitorApiTests(unittest.TestCase):
         cls.token_path = cls.data_dir / "monitor-token"
         cls.token = "synthetic-monitor-token-0123456789abcdef-0123456789abcdef"
         cls.token_path.write_text(cls.token + "\n", encoding="ascii")
+        cls.token_path.chmod(0o600)
         os.environ.update(
             {
                 "PANEL_DATA_DIR": str(cls.data_dir),
