@@ -42,6 +42,9 @@ services:
       PANEL_INTERNAL_URL: http://panel:5000
       VPN_ENDPOINT_MONITOR_TOKEN_FILE: /run/secrets/monitor-token
       VPN_ENDPOINT_MONITOR_TARGET_IDS: ${VPN_ENDPOINT_MONITOR_TARGET_IDS}
+      # Contract only: host firewall/egress proxy must enforce this policy.
+      # Docker bridge networking alone does not enforce destination policy.
+      VPN_ENDPOINT_MONITOR_EGRESS_POLICY: external-global-unicast-only
     secrets:
       - source: monitor_token
         target: monitor-token
