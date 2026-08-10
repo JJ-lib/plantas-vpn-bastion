@@ -12,6 +12,7 @@ from vpn_endpoint_health import (
     MAX_LATENCY_MS,
     MAX_TIMESTAMP,
     StaleRevisionError,
+    StaleCycleError,
     apply_probe_result,
     ensure_endpoint_health_schema,
     health_for_vpns,
@@ -23,6 +24,9 @@ from vpn_endpoint_health import (
 TABLE_FIELDS = {
     "vpn_id",
     "target_revision",
+    "target_generation",
+    "cycle_id",
+    "lease_id",
     "probe_type",
     "state",
     "public_code",
@@ -32,6 +36,8 @@ TABLE_FIELDS = {
     "last_success_at",
     "last_transition_at",
     "latency_ms",
+    "last_accepted_at",
+    "last_conclusive_at",
 }
 STATES = {"healthy", "suspect", "down", "unknown", "stale", "disabled"}
 
@@ -52,9 +58,10 @@ class EndpointHealthSchemaTests(unittest.TestCase):
         conn.execute(
             "INSERT INTO vpn_endpoint_health("
             "vpn_id,target_revision,probe_type,state,public_code,"
+            "target_generation,cycle_id,lease_id,"
             "consecutive_failures,first_failure_at,last_checked_at,"
-            "last_success_at,last_transition_at,latency_ms"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "last_success_at,last_transition_at,latency_ms,last_accepted_at,last_conclusive_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 vpn_id,
                 "a" * 64,
@@ -62,6 +69,11 @@ class EndpointHealthSchemaTests(unittest.TestCase):
                 state,
                 "not_checked",
                 0,
+                0,
+                "synthetic-lease",
+                0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -133,6 +145,7 @@ class EndpointHealthBehaviorTests(unittest.TestCase):
         self.conn.execute("INSERT INTO vpns VALUES(1, 1, 'active')")
         ensure_endpoint_health_schema(self.conn)
         self.revision = target_revision(TARGET)
+        self.next_cycle = 1
 
     def result(
         self,
@@ -143,10 +156,16 @@ class EndpointHealthBehaviorTests(unittest.TestCase):
         observed_at=1_000,
         latency_ms=25,
         probe_type="tcp_connect",
+        target_generation=1,
+        cycle_id=1,
+        lease_id="synthetic-lease",
     ):
         return {
             "vpn_id": 1,
             "target_revision": revision or self.revision,
+            "target_generation": target_generation,
+            "cycle_id": cycle_id,
+            "lease_id": lease_id,
             "probe_type": probe_type,
             "outcome": outcome,
             "public_code": code,
@@ -159,6 +178,8 @@ class EndpointHealthBehaviorTests(unittest.TestCase):
 
     def apply(self, **changes):
         expected_revision = changes.pop("expected_revision", self.revision)
+        changes.setdefault("cycle_id", self.next_cycle)
+        self.next_cycle = max(self.next_cycle, changes["cycle_id"] + 1)
         return apply_probe_result(
             self.conn,
             self.result(**changes),
@@ -351,12 +372,42 @@ class EndpointHealthBehaviorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(after), tuple(before))
 
+    def test_older_cycle_is_rejected_atomically_and_duplicate_is_idempotent(self):
+        first = self.apply(cycle_id=2, observed_at=1_000)
+        duplicate = self.apply(cycle_id=2, observed_at=1_300, latency_ms=99)
+        self.assertEqual(duplicate, first)
+        self.assertEqual(self.health(now=1_300)["last_checked_at"], 1_000)
+
+        with self.assertRaises(StaleCycleError):
+            self.apply(cycle_id=1, outcome="unreachable", code="tcp_unreachable")
+        self.assertEqual(self.health(now=1_300)["cycle_id"], 2)
+
+    def test_new_generation_resets_state_and_acceptance_is_separate_from_conclusive_time(self):
+        self.apply(cycle_id=1, outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
+        self.apply(cycle_id=2, outcome="inconclusive", code="probe_error", latency_ms=None, observed_at=1_500)
+        health = self.health(now=1_500)
+        self.assertEqual(health["last_accepted_at"], 1_500)
+        self.assertEqual(health["last_conclusive_at"], 1_000)
+
+        result = self.apply(target_generation=2, cycle_id=1, observed_at=2_000)
+        self.assertEqual(result["target_generation"], 2)
+        self.assertEqual(result["cycle_id"], 1)
+        self.assertEqual(self.health(now=2_000)["state"], "healthy")
+
+    def test_lease_id_is_part_of_the_accepted_cycle(self):
+        self.apply(lease_id="lease-a")
+        with self.assertRaises(ValueError):
+            self.apply(lease_id="lease-b", cycle_id=1)
+
 
 class EndpointHealthValidationTests(unittest.TestCase):
     def valid_result(self):
         return {
             "vpn_id": 1,
             "target_revision": target_revision(TARGET),
+            "target_generation": 1,
+            "cycle_id": 1,
+            "lease_id": "synthetic-lease",
             "probe_type": "tcp_connect",
             "outcome": "reachable",
             "public_code": "tcp_accept",

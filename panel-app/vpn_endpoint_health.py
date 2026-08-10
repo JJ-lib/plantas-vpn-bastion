@@ -29,6 +29,9 @@ MAX_CONSECUTIVE_FAILURES = 255
 MAX_LATENCY_MS = 60_000
 MAX_TIMESTAMP = 253_402_300_799  # 9999-12-31T23:59:59Z
 MAX_VPN_ID = 2**63 - 1
+MAX_TARGET_GENERATION = 2**63 - 1
+MAX_CYCLE_ID = 2**63 - 1
+MAX_LEASE_ID_LENGTH = 128
 MAX_HEALTH_QUERY_IDS = 500
 STALE_AFTER_SECONDS = 15 * 60
 
@@ -36,6 +39,9 @@ _RESULT_FIELDS = frozenset(
     {
         "vpn_id",
         "target_revision",
+        "target_generation",
+        "cycle_id",
+        "lease_id",
         "probe_type",
         "outcome",
         "public_code",
@@ -66,6 +72,9 @@ _PUBLIC_CODE_RULES = {
 _HEALTH_COLUMNS = (
     "vpn_id",
     "target_revision",
+    "target_generation",
+    "cycle_id",
+    "lease_id",
     "probe_type",
     "state",
     "public_code",
@@ -75,6 +84,8 @@ _HEALTH_COLUMNS = (
     "last_success_at",
     "last_transition_at",
     "latency_ms",
+    "last_accepted_at",
+    "last_conclusive_at",
 )
 _HEALTH_COLUMN_SQL = ",".join(_HEALTH_COLUMNS)
 
@@ -82,6 +93,9 @@ _SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS vpn_endpoint_health(
     vpn_id INTEGER PRIMARY KEY CHECK(vpn_id BETWEEN 1 AND {MAX_VPN_ID}),
     target_revision TEXT NOT NULL CHECK(length(target_revision) = 64),
+    target_generation INTEGER NOT NULL CHECK(target_generation BETWEEN 0 AND {MAX_TARGET_GENERATION}),
+    cycle_id INTEGER NOT NULL CHECK(cycle_id BETWEEN 0 AND {MAX_CYCLE_ID}),
+    lease_id TEXT NOT NULL CHECK(length(lease_id) BETWEEN 1 AND {MAX_LEASE_ID_LENGTH}),
     probe_type TEXT NOT NULL CHECK(probe_type IN ('tcp_connect','ike','openvpn_udp')),
     state TEXT NOT NULL CHECK(state IN ('healthy','suspect','down','unknown','stale','disabled')),
     public_code TEXT NOT NULL CHECK(length(public_code) BETWEEN 1 AND 64),
@@ -96,13 +110,21 @@ CREATE TABLE IF NOT EXISTS vpn_endpoint_health(
     last_transition_at INTEGER
         CHECK(last_transition_at IS NULL OR last_transition_at BETWEEN 0 AND {MAX_TIMESTAMP}),
     latency_ms INTEGER
-        CHECK(latency_ms IS NULL OR latency_ms BETWEEN 0 AND {MAX_LATENCY_MS})
+        CHECK(latency_ms IS NULL OR latency_ms BETWEEN 0 AND {MAX_LATENCY_MS}),
+    last_accepted_at INTEGER
+        CHECK(last_accepted_at IS NULL OR last_accepted_at BETWEEN 0 AND {MAX_TIMESTAMP}),
+    last_conclusive_at INTEGER
+        CHECK(last_conclusive_at IS NULL OR last_conclusive_at BETWEEN 0 AND {MAX_TIMESTAMP})
 )
 """
 
 
 class StaleRevisionError(ValueError):
     """The worker result does not describe the panel's current target."""
+
+
+class StaleCycleError(ValueError):
+    """The result belongs to an older panel-issued cycle."""
 
 
 def _mapping_keys(value: Any) -> set[str]:
@@ -160,6 +182,16 @@ def _bounded_enum(value: Any, label: str, accepted: frozenset[str]) -> str:
 def _validated_revision(value: Any) -> str:
     if not isinstance(value, str) or not _REVISION_RE.fullmatch(value):
         raise ValueError("Invalid target revision.")
+    return value
+
+
+def _validated_lease(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= MAX_LEASE_ID_LENGTH
+        or not value.isascii()
+    ):
+        raise ValueError("Invalid lease_id.")
     return value
 
 
@@ -244,6 +276,16 @@ def validate_result(result: Any) -> dict[str, Any]:
         _required_value(result, "vpn_id"), "vpn_id", 1, MAX_VPN_ID
     )
     revision = _validated_revision(_required_value(result, "target_revision"))
+    target_generation = _strict_int(
+        _required_value(result, "target_generation"),
+        "target_generation",
+        0,
+        MAX_TARGET_GENERATION,
+    )
+    cycle_id = _strict_int(
+        _required_value(result, "cycle_id"), "cycle_id", 0, MAX_CYCLE_ID
+    )
+    lease_id = _validated_lease(_required_value(result, "lease_id"))
     probe_type = _bounded_enum(
         _required_value(result, "probe_type"), "probe_type", PROBE_TYPES
     )
@@ -275,6 +317,9 @@ def validate_result(result: Any) -> dict[str, Any]:
     return {
         "vpn_id": vpn_id,
         "target_revision": revision,
+        "target_generation": target_generation,
+        "cycle_id": cycle_id,
+        "lease_id": lease_id,
         "probe_type": probe_type,
         "outcome": outcome,
         "public_code": public_code,
@@ -315,6 +360,17 @@ def ensure_endpoint_health_schema(conn: sqlite3.Connection) -> None:
 
     with _write_transaction(conn, "endpoint_health_schema"):
         conn.execute(_SCHEMA_SQL)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
+        migrations = (
+            ("target_generation", "INTEGER NOT NULL DEFAULT 0"),
+            ("cycle_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("lease_id", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("last_accepted_at", "INTEGER"),
+            ("last_conclusive_at", "INTEGER"),
+        )
+        for name, definition in migrations:
+            if name not in columns:
+                conn.execute(f"ALTER TABLE vpn_endpoint_health ADD COLUMN {name} {definition}")
 
 
 def _health_row(conn: sqlite3.Connection, vpn_id: int) -> dict[str, Any] | None:
@@ -330,32 +386,53 @@ def apply_probe_result(
     result: Any,
     *,
     expected_revision: str,
+    expected_generation: int | None = None,
 ) -> dict[str, Any]:
     """Atomically compare revision, apply one observation, and return stored state."""
 
     normalized = validate_result(result)
     expected = _validated_revision(expected_revision)
+    expected_generation = normalized["target_generation"] if expected_generation is None else _strict_int(
+        expected_generation, "expected_generation", 0, MAX_TARGET_GENERATION
+    )
 
     with _write_transaction(conn, "endpoint_health_apply"):
         if normalized["target_revision"] != expected:
             raise StaleRevisionError("The endpoint target changed before this result arrived.")
+        if normalized["target_generation"] != expected_generation:
+            raise StaleRevisionError("The endpoint target generation changed before this result arrived.")
 
         previous = _health_row(conn, normalized["vpn_id"])
-        revision_changed = previous is None or previous["target_revision"] != expected
+        generation_changed = (
+            previous is None
+            or previous["target_generation"] != expected_generation
+            or previous["target_revision"] != expected
+        )
+        if previous is not None and normalized["target_generation"] < previous["target_generation"]:
+            raise StaleRevisionError("The endpoint target generation is older than stored state.")
+        if previous is not None and not generation_changed:
+            if normalized["cycle_id"] < previous["cycle_id"]:
+                raise StaleCycleError("The endpoint cycle is older than stored state.")
+            if normalized["cycle_id"] == previous["cycle_id"]:
+                if normalized["lease_id"] != previous["lease_id"]:
+                    raise ValueError("The endpoint cycle lease does not match stored state.")
+                return previous
         observed_at = normalized["observed_at"]
 
-        if revision_changed:
+        if generation_changed:
             old_state = "unknown"
             failures = 0
             first_failure_at = None
             last_success_at = None
             last_transition_at = observed_at
+            last_conclusive_at = None
         else:
             old_state = previous["state"]
             failures = previous["consecutive_failures"]
             first_failure_at = previous["first_failure_at"]
             last_success_at = previous["last_success_at"]
             last_transition_at = previous["last_transition_at"]
+            last_conclusive_at = previous["last_conclusive_at"]
 
         if normalized["outcome"] == "reachable":
             state = "healthy"
@@ -370,12 +447,17 @@ def apply_probe_result(
         else:
             state = old_state
 
-        if not revision_changed and state != old_state:
+        if normalized["outcome"] != "inconclusive":
+            last_conclusive_at = observed_at
+        if not generation_changed and state != old_state:
             last_transition_at = observed_at
 
         values = (
             normalized["vpn_id"],
             expected,
+            normalized["target_generation"],
+            normalized["cycle_id"],
+            normalized["lease_id"],
             normalized["probe_type"],
             state,
             normalized["public_code"],
@@ -385,12 +467,17 @@ def apply_probe_result(
             last_success_at,
             last_transition_at,
             normalized["latency_ms"],
+            observed_at,
+            last_conclusive_at,
         )
         conn.execute(
             "INSERT INTO vpn_endpoint_health("
-            f"{_HEALTH_COLUMN_SQL}) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            f"{_HEALTH_COLUMN_SQL}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(vpn_id) DO UPDATE SET "
             "target_revision=excluded.target_revision,"
+            "target_generation=excluded.target_generation,"
+            "cycle_id=excluded.cycle_id,"
+            "lease_id=excluded.lease_id,"
             "probe_type=excluded.probe_type,"
             "state=excluded.state,"
             "public_code=excluded.public_code,"
@@ -399,7 +486,9 @@ def apply_probe_result(
             "last_checked_at=excluded.last_checked_at,"
             "last_success_at=excluded.last_success_at,"
             "last_transition_at=excluded.last_transition_at,"
-            "latency_ms=excluded.latency_ms",
+            "latency_ms=excluded.latency_ms,"
+            "last_accepted_at=excluded.last_accepted_at,"
+            "last_conclusive_at=excluded.last_conclusive_at",
             values,
         )
         stored = _health_row(conn, normalized["vpn_id"])
@@ -412,6 +501,9 @@ def _unknown_health(vpn_id: int) -> dict[str, Any]:
     return {
         "vpn_id": vpn_id,
         "target_revision": None,
+        "target_generation": None,
+        "cycle_id": None,
+        "lease_id": None,
         "probe_type": None,
         "state": "unknown",
         "public_code": "not_checked",
@@ -421,6 +513,8 @@ def _unknown_health(vpn_id: int) -> dict[str, Any]:
         "last_success_at": None,
         "last_transition_at": None,
         "latency_ms": None,
+        "last_accepted_at": None,
+        "last_conclusive_at": None,
         "stored_state": "unknown",
         "is_stale": False,
     }
