@@ -1,7 +1,7 @@
 # VPN Public Endpoint Monitoring Design
 
-**Status:** Proposed and approved for implementation planning  
-**Date:** 2026-08-10  
+**Status:** Proposed and approved for implementation planning
+**Date:** 2026-08-10
 **Scope:** Generic Bastion VPN control plane
 
 ## 1. Purpose
