@@ -13,6 +13,9 @@ services:
       BASTION_PUBLIC_ORIGIN: ${BASTION_PUBLIC_ORIGIN:-http://127.0.0.1}
       VALIDATION_DENY_CIDRS: ${VALIDATION_DENY_CIDRS:?Set VALIDATION_DENY_CIDRS outside Git}
       VPN_ENDPOINT_MONITOR_TOKEN_FILE: /run/secrets/monitor-token
+      VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED: ${VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED:-false}
+      VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED: ${VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED:-false}
+      VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED: ${VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED:-false}
     volumes:
       - panel_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -35,6 +38,7 @@ services:
     environment:
       PANEL_INTERNAL_URL: http://panel:5000
       VPN_ENDPOINT_MONITOR_TOKEN_FILE: /run/secrets/monitor-token
+      VPN_ENDPOINT_MONITOR_TARGET_IDS: ${VPN_ENDPOINT_MONITOR_TARGET_IDS}
     secrets:
       - source: monitor_token
         target: monitor-token

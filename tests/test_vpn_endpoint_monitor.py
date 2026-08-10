@@ -8,7 +8,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "panel-app"))
 
-from vpn_endpoint_monitor import (  # noqa: E402
+import vpn_endpoint_monitor as monitor  # noqa: E402
+from vpn_endpoint_monitor import (
     MAX_HOST_LENGTH,
     MAX_LATENCY_MS,
     MAX_PORT,
@@ -607,6 +608,23 @@ class WorkerContractTests(unittest.TestCase):
             self.assertEqual(load_monitor_token("/run/secrets/token"), "synthetic-token-1")
             path_type.return_value.read_bytes.assert_called_once_with()
 
+    def test_main_prefers_panel_internal_url_environment_contract(self):
+        import vpn_endpoint_monitor as monitor
+
+        with mock.patch.dict(
+            monitor.os.environ,
+            {
+                "PANEL_INTERNAL_URL": "http://internal-panel.test",
+                "PANEL_URL": "http://legacy-panel.test",
+            },
+            clear=False,
+        ), mock.patch.object(monitor, "load_monitor_token", return_value="token"), mock.patch.object(
+            monitor, "PanelClient"
+        ) as client_type, mock.patch.object(monitor, "run_worker"):
+            self.assertEqual(monitor.main(["--once"]), 0)
+
+        self.assertEqual(client_type.call_args.args[0], "http://internal-panel.test")
+
     def test_panel_client_uses_stdlib_http_and_bearer_token(self):
         requests = []
 
@@ -698,6 +716,43 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(run_worker(Client(), once=False, max_cycles=2, cycle=cycle,
                                     sleep=sleeps.append, interval=300, jitter=lambda _interval: 0), 2)
         self.assertAlmostEqual(sleeps[0], 300.0, places=3)
+
+    def test_target_selector_distinguishes_unset_all_targets_from_explicit_empty(self):
+        self.assertIsNone(monitor.parse_target_selector(None))
+        self.assertEqual(monitor.parse_target_selector(""), frozenset())
+        self.assertEqual(monitor.parse_target_selector("7, 9,7"), frozenset({7, 9}))
+        self.assertEqual(
+            [target["vpn_id"] for target in monitor.select_targets(
+                [self.target(7), self.target(8)], frozenset({8})
+            )],
+            [8],
+        )
+
+    def test_target_selector_rejects_non_numeric_or_non_positive_ids(self):
+        for value in ("abc", "0", "1,-2", "1;2"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    monitor.parse_target_selector(value)
+
+    def test_run_cycle_canary_only_probes_explicitly_selected_targets(self):
+        targets = [self.target(7), self.target(8)]
+        observed = []
+        posted = []
+
+        class Client:
+            def fetch_targets(self): return targets
+            def post_results(self, results): posted.append(results)
+
+        def probe(target):
+            observed.append(target["vpn_id"])
+            return {"vpn_id": target["vpn_id"], "target_revision": REVISION,
+                    "target_generation": 1, "cycle_id": 2, "lease_id": "lease-2",
+                    "probe_type": "tcp_connect", "outcome": "reachable",
+                    "public_code": "tcp_accept", "latency_ms": 1, "observed_at": 1}
+
+        self.assertEqual(run_cycle(Client(), probe=probe, target_ids=frozenset({8})), 1)
+        self.assertEqual(observed, [8])
+        self.assertEqual([row["vpn_id"] for row in posted[0]], [8])
 
 
 if __name__ == "__main__":

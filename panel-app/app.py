@@ -378,8 +378,16 @@ def admin(f):
     return w
 
 ENDPOINT_PUBLIC_ALERTS_ENV='VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED'
+ENDPOINT_MONITOR_COLLECTION_ENV='VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED'
+ENDPOINT_ADMIN_DIAGNOSTICS_ENV='VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED'
+def _feature_enabled(name):
+    return os.environ.get(name,'false').strip().lower() in {'1','true','yes','on'}
 def endpoint_public_alerts_enabled():
-    return os.environ.get(ENDPOINT_PUBLIC_ALERTS_ENV,'false').strip().lower() in {'1','true','yes','on'}
+    return _feature_enabled(ENDPOINT_PUBLIC_ALERTS_ENV)
+def endpoint_monitor_collection_enabled():
+    return _feature_enabled(ENDPOINT_MONITOR_COLLECTION_ENV)
+def endpoint_admin_diagnostics_enabled():
+    return _feature_enabled(ENDPOINT_ADMIN_DIAGNOSTICS_ENV)
 
 ENDPOINT_STATE_LABELS={'healthy':'Saludable','suspect':'Primer fallo pendiente de confirmar','down':'Sin respuesta','unknown':'Sin comprobar','stale':'Comprobación obsoleta','disabled':'Monitorización desactivada'}
 ENDPOINT_CODE_LABELS={'tcp_accept':'Conexión TCP aceptada','tcp_unreachable':'Sin respuesta TCP','ike_response':'Respuesta IKE recibida','ike_no_response':'Sin respuesta IKE','openvpn_udp_response':'Respuesta OpenVPN recibida','udp_port_unreachable':'Puerto UDP rechazado','udp_silent':'Silencio UDP inconcluyente','dns_failed':'Fallo de resolución DNS','dns_failure':'Fallo de resolución DNS','dns_timeout':'Tiempo de resolución agotado','dns_no_answers':'DNS sin respuestas','dns_no_global_address':'DNS sin dirección pública válida','private_or_reserved_destination':'Destino no público','probe_error':'Error de sonda','unsupported_probe':'Sonda no compatible','not_checked':'Sin observación'}
@@ -391,11 +399,13 @@ def endpoint_health_map(vpns):
 def endpoint_card_alert(health,online,admin_view=False):
     if not health or health.get('state')!='down' or int(health.get('consecutive_failures') or 0)<2:return ''
     if online:
+        if not endpoint_admin_diagnostics_enabled():return ''
         return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>" if admin_view else ''
     if not endpoint_public_alerts_enabled():return ''
     return "<div class='endpoint-alert' role='status' aria-live='polite'><strong>El servidor público de la VPN no responde</strong><span>Se han confirmado dos fallos consecutivos.</span></div>"
 
 def endpoint_health_admin_markup(health):
+    if not endpoint_admin_diagnostics_enabled():return ''
     health=health or {'state':'unknown','consecutive_failures':0,'public_code':'not_checked','last_checked_at':None,'last_success_at':None,'latency_ms':None}
     state=str(health.get('state') or 'unknown');label=ENDPOINT_STATE_LABELS.get(state,ENDPOINT_STATE_LABELS['unknown']);code=ENDPOINT_CODE_LABELS.get(str(health.get('public_code') or 'not_checked'),ENDPOINT_CODE_LABELS['probe_error'])
     def local_time(value):
@@ -437,7 +447,7 @@ def _monitor_authorized():
 def monitor_internal(f):
     @functools.wraps(f)
     def wrapped(*args,**kwargs):
-        if not _monitor_authorized():abort(404)
+        if not endpoint_monitor_collection_enabled() or not _monitor_authorized():abort(404)
         return f(*args,**kwargs)
     return wrapped
 

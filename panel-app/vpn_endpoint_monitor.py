@@ -1216,6 +1216,7 @@ MAX_HTTP_RESPONSE_BYTES = 64 * 1024
 MAX_HTTP_REQUEST_BYTES = 64 * 1024
 MAX_BACKOFF_SECONDS = 600.0
 WORKER_HTTP_TIMEOUT_SECONDS = 3.0
+TARGET_IDS_ENV = "VPN_ENDPOINT_MONITOR_TARGET_IDS"
 
 
 def load_monitor_token(path: str | os.PathLike[str]) -> str:
@@ -1310,10 +1311,37 @@ def bounded_jitter(interval: float, *, random_value: float | None = None) -> flo
     return value * min(30.0, interval * 0.1)
 
 
+def parse_target_selector(value: str | None) -> frozenset[int] | None:
+    """Parse an explicit numeric allowlist; None means production all-target mode."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("target selector must be text")
+    if not value.strip():
+        return frozenset()
+    selected: set[int] = set()
+    for raw_id in value.split(","):
+        item = raw_id.strip()
+        if not item or not item.isascii() or not item.isdecimal():
+            raise ValueError("target selector must contain numeric VPN IDs")
+        vpn_id = int(item, 10)
+        if not 1 <= vpn_id <= MAX_VPN_ID:
+            raise ValueError("target selector contains an invalid VPN ID")
+        selected.add(vpn_id)
+    return frozenset(selected)
+
+
+def select_targets(targets: Iterable[Mapping[str, Any]], target_ids: frozenset[int] | None) -> list[Mapping[str, Any]]:
+    """Filter a fetched production snapshot without creating synthetic targets."""
+    if target_ids is None:
+        return list(targets)
+    return [target for target in targets if target.get("vpn_id") in target_ids]
+
+
 def run_cycle(client: PanelClient, *, probe: Callable[[Mapping[str, Any]], Mapping[str, Any]] = dispatch_probe,
-              workers: int = DEFAULT_WORKERS) -> int:
+              workers: int = DEFAULT_WORKERS, target_ids: frozenset[int] | None = None) -> int:
     """Fetch one bounded target snapshot, probe it, and submit normalized DTOs."""
-    targets = client.fetch_targets()
+    targets = select_targets(client.fetch_targets(), target_ids)
     if isinstance(workers, bool) or not isinstance(workers, int):
         raise ValueError("workers must be an integer")
     worker_count = min(max(workers, 1), MAX_WORKERS)
@@ -1375,11 +1403,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--timeout", type=float, default=DEFAULT_PROBE_TIMEOUT_SECONDS)
+    parser.add_argument("--target-ids", default=os.environ.get(TARGET_IDS_ENV))
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
     try:
+        target_ids = parse_target_selector(args.target_ids)
         client = PanelClient(args.panel_url, load_monitor_token(args.token_file))
-        run_worker(client, once=args.once, interval=args.interval, workers=args.workers, timeout=args.timeout)
+        run_worker(
+            client,
+            once=args.once,
+            interval=args.interval,
+            workers=args.workers,
+            timeout=args.timeout,
+            cycle=lambda current_client, **kwargs: run_cycle(
+                current_client, target_ids=target_ids, **kwargs
+            ),
+        )
     except Exception:
         # Never print exception text: it can contain deployment URLs or secret
         # material supplied by an HTTP/auth implementation.

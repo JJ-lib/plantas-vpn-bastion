@@ -95,7 +95,29 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
     def test_environment_contract_documents_external_monitor_inputs(self):
         self.assertRegex(self.env_text, r"(?m)^MONITOR_IMAGE=replace-with-immutable-monitor-image\s*$")
         self.assertRegex(self.env_text, r"(?m)^VPN_ENDPOINT_MONITOR_TOKEN_FILE=replace-with-external-token-file\s*$")
+        self.assertRegex(self.env_text, r"(?m)^VPN_ENDPOINT_MONITOR_TARGET_IDS=.*$")
+        self.assertRegex(self.env_text, r"(?m)^VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED=false\s*$")
+        self.assertRegex(self.env_text, r"(?m)^VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED=false\s*$")
+        self.assertRegex(self.env_text, r"(?m)^VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED=false\s*$")
         self.assertNotIn("monitor-token-value", self.env_text)
+
+    def test_compose_passes_independent_fail_closed_gates_and_selector(self):
+        self.assertEqual(
+            self.panel["environment"]["VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED"],
+            "${VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED:-false}",
+        )
+        self.assertEqual(
+            self.panel["environment"]["VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED"],
+            "${VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED:-false}",
+        )
+        self.assertEqual(
+            self.panel["environment"]["VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED"],
+            "${VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED:-false}",
+        )
+        self.assertEqual(
+            self.monitor["environment"]["VPN_ENDPOINT_MONITOR_TARGET_IDS"],
+            "${VPN_ENDPOINT_MONITOR_TARGET_IDS}",
+        )
 
 
 if __name__ == "__main__":

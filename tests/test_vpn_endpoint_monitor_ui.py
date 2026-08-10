@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 try:
@@ -35,6 +36,8 @@ class EndpointMonitorUiTests(unittest.TestCase):
                 "PANEL_BOOTSTRAP_ADMIN_PASSWORD": "synthetic-ui-password-only",
                 "PANEL_TEST_ALLOW_MISSING_CSRF": "1",
                 "VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED": "true",
+                "VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED": "true",
+                "VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED": "true",
             }
         )
         spec = importlib.util.spec_from_file_location("endpoint_monitor_ui_app", PANEL / "app.py")
@@ -192,6 +195,50 @@ class EndpointMonitorUiTests(unittest.TestCase):
     def test_unauthorized_user_cannot_view_admin_diagnostics(self):
         self.login_as(self.viewer_id)
         self.assertEqual(self.client.get("/admin/vpns").status_code, 403)
+
+    def test_collection_and_admin_diagnostics_flags_fail_closed_independently(self):
+        with self.mod.app.app_context():
+            target = self.mod._monitor_target_from_row(
+                self.mod.db().execute("SELECT * FROM vpns WHERE id=?", (self.vpn_id,)).fetchone()
+            )
+        with self.mod.app.test_request_context():
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED": "false",
+                    "VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED": "true",
+                },
+                clear=False,
+            ):
+                self.assertFalse(self.mod.endpoint_monitor_collection_enabled())
+                self.assertEqual(
+                    self.client.get("/internal/vpn-endpoint-monitor/targets").status_code,
+                    404,
+                )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED": "true",
+                "VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED": "false",
+            },
+            clear=False,
+        ):
+            self.assertTrue(self.mod.endpoint_monitor_collection_enabled())
+            self.assertFalse(self.mod.endpoint_admin_diagnostics_enabled())
+            self.login_as(1)
+            body = self.client.get("/admin/vpns").get_data(as_text=True)
+            self.assertNotIn("Endpoint público", body)
+            self.assertNotIn("Sin respuesta IKE", body)
+
+    def test_missing_gate_values_are_fail_closed_and_public_alert_default_is_false(self):
+        with mock.patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            self.assertFalse(self.mod.endpoint_monitor_collection_enabled())
+            self.assertFalse(self.mod.endpoint_admin_diagnostics_enabled())
+            self.assertFalse(self.mod.endpoint_public_alerts_enabled())
 
 
 if __name__ == "__main__":
