@@ -42,6 +42,7 @@ MAX_TARGET_GENERATION = 2**63 - 1
 MAX_CYCLE_ID = 2**63 - 1
 MAX_LEASE_ID_LENGTH = 128
 MAX_VPN_ID = 2**63 - 1
+MAX_MONITOR_BATCH = 500
 MAX_DNS_ANSWERS = 32
 MAX_UDP_RESPONSE_BYTES = 4_096
 MAX_SCANNER_OUTPUT_BYTES = 64 * 1024
@@ -77,6 +78,7 @@ _PUBLIC_CODES = frozenset(
         "tcp_unreachable",
         "ike_response",
         "ike_no_response",
+        "ike_unreachable",
         "openvpn_udp_response",
         "udp_port_unreachable",
         "udp_silent",
@@ -719,6 +721,7 @@ def build_ike_scan_argv(
     *,
     timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
     retries: int = DEFAULT_RETRIES,
+    destination_port: int | None = None,
 ) -> list[str]:
     """Build an allowlisted, credential-free ``ike-scan`` argv array."""
 
@@ -739,15 +742,16 @@ def build_ike_scan_argv(
 
     # IKE uses the standards-defined destination ports only.  Never turn a
     # deployment row's arbitrary service port into an IKE probe destination.
-    expected_port = 4500 if normalized["nat_t"] else 500
-    if normalized["port"] != expected_port:
+    allowed_ports = {500, 4500} if normalized["nat_t"] else {500}
+    if normalized["port"] not in allowed_ports:
         raise ValueError("IPsec endpoint must use UDP/500 or UDP/4500 for NAT-T.")
-    destination_port = expected_port
+    destination_port = normalized["port"] if destination_port is None else destination_port
+    if destination_port not in (500, 4500):
+        raise ValueError("ike-scan destination port is invalid.")
     argv = [
         "ike-scan",
         f"--retry={limits.retries}",
         f"--timeout={_format_timeout(limits.timeout_seconds * 1000)}",
-        "--sport=0",
         f"--dport={destination_port}",
     ]
     if normalized["ike_version"] == "ikev2":
@@ -758,6 +762,13 @@ def build_ike_scan_argv(
         argv.append("--nat-t")
     argv.append(normalized["host"])
     return argv
+
+
+def build_ike_scan_argvs(target: Mapping[str, Any], *, timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS, retries: int = DEFAULT_RETRIES) -> list[list[str]]:
+    """Build UDP/500 plus UDP/4500 attempts for NAT-T without forcing a source port."""
+    normalized = validate_target(target)
+    ports = (500, 4500) if normalized.get("nat_t") else (500,)
+    return [build_ike_scan_argv(normalized, timeout_seconds=timeout_seconds, retries=retries, destination_port=port) for port in ports]
 
 
 def classify_ike_scan_output(
@@ -883,40 +894,25 @@ def probe_ike(
     for address in eligible:
         scan_target = dict(normalized, host=address)
         try:
-            argv = build_ike_scan_argv(
+            argv_list = build_ike_scan_argvs(
                 scan_target,
                 timeout_seconds=float(active_limits.timeout_seconds),
                 retries=active_limits.retries,
             )
-            returncode, stdout, stderr = _run_ike(
-                runner,
-                argv,
-                float(active_limits.timeout_seconds),
-            )
-            classification = classify_ike_scan_output(
-                stdout,
-                stderr,
-                returncode=returncode,
-            )
-            if classification["public_code"] == "ike_response":
-                return _dto(
-                    normalized,
-                    outcome="reachable",
-                    public_code="ike_response",
-                    latency_ms=_bounded_latency_ms(
-                        clock, started, active_limits.max_latency_ms
-                    ),
-                    clock=clock,
-                    probe_type="ike",
-                )
-            if classification["outcome"] == "inconclusive":
-                saw_inconclusive = True
-            if classification["public_code"] == "probe_error":
-                saw_tool_failure = True
-        except (subprocess.TimeoutExpired, TimeoutError, socket.timeout):
-            # UDP filtering and responder silence are not conclusive evidence.
-            saw_inconclusive = True
-            continue
+            for argv in argv_list:
+                try:
+                    returncode, stdout, stderr = _run_ike(runner, argv, float(active_limits.timeout_seconds))
+                    classification = classify_ike_scan_output(stdout, stderr, returncode=returncode)
+                    if classification["public_code"] == "ike_response":
+                        return _dto(normalized, outcome="reachable", public_code="ike_response", latency_ms=_bounded_latency_ms(clock, started, active_limits.max_latency_ms), clock=clock, probe_type="ike")
+                    if classification["outcome"] == "inconclusive":
+                        saw_inconclusive = True
+                    if classification["public_code"] == "probe_error":
+                        saw_tool_failure = True
+                except (subprocess.TimeoutExpired, TimeoutError, socket.timeout):
+                    saw_inconclusive = True
+                except Exception:
+                    saw_tool_failure = True
         except Exception:
             saw_tool_failure = True
 
@@ -925,7 +921,7 @@ def probe_ike(
     elif saw_inconclusive:
         outcome, code = "inconclusive", "ike_no_response"
     else:
-        outcome, code = "unreachable", "ike_no_response"
+        outcome, code = "unreachable", "ike_unreachable"
     return _dto(
         normalized,
         outcome=outcome,
@@ -1202,6 +1198,7 @@ __all__ = [
     "ProbeLimits",
     "RESULT_FIELDS",
     "build_ike_scan_argv",
+    "build_ike_scan_argvs",
     "build_ike_scan_command",
     "classify_ike_scan_output",
     "classify_ike_output",
@@ -1233,7 +1230,7 @@ __all__ = [
 DEFAULT_INTERVAL_SECONDS = 300.0
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 4
-MAX_HTTP_RESPONSE_BYTES = 64 * 1024
+MAX_HTTP_RESPONSE_BYTES = 512 * 1024
 MAX_HTTP_REQUEST_BYTES = 64 * 1024
 MAX_BACKOFF_SECONDS = 600.0
 WORKER_HTTP_TIMEOUT_SECONDS = 3.0
@@ -1315,19 +1312,32 @@ class PanelClient:
             return _decode_json(_read_bounded(response))
 
     def fetch_targets(self) -> list[dict[str, Any]]:
-        payload = self._request("GET", "/internal/vpn-endpoint-monitor/targets")
-        if not isinstance(payload, dict) or not isinstance(payload.get("targets"), list):
-            raise ValueError("panel target schema is invalid")
-        targets = payload["targets"]
-        if len(targets) > 256:
-            raise ValueError("panel target count exceeds the size limit")
+        targets = []
+        after_id = 0
+        while True:
+            path = "/internal/vpn-endpoint-monitor/targets"
+            if after_id:
+                path += "?after_id=" + str(after_id) + "&limit=" + str(MAX_MONITOR_BATCH)
+            payload = self._request("GET", path)
+            if not isinstance(payload, dict) or not isinstance(payload.get("targets"), list):
+                raise ValueError("panel target schema is invalid")
+            page = payload["targets"]
+            if len(page) > MAX_MONITOR_BATCH:
+                raise ValueError("panel target count exceeds the size limit")
+            targets.extend(page)
+            next_after = payload.get("next_after_id")
+            if next_after is None:
+                break
+            if isinstance(next_after, bool) or not isinstance(next_after, int) or next_after <= after_id:
+                raise ValueError("panel target pagination cursor is invalid")
+            after_id = next_after
         normalized = []
         for target in targets:
             normalized.append(validate_target(target))
         return normalized
 
     def post_results(self, results: list[Mapping[str, Any]]) -> Any:
-        if not isinstance(results, list) or len(results) > 256:
+        if not isinstance(results, list) or len(results) > MAX_MONITOR_BATCH:
             raise ValueError("panel result count exceeds the size limit")
         for result in results:
             if not isinstance(result, Mapping) or set(result) != set(RESULT_FIELDS):

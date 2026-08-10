@@ -55,6 +55,7 @@ _PUBLIC_CODE_RULES = {
     "tcp_accept": ("reachable", frozenset({"tcp_connect"})),
     "tcp_unreachable": ("unreachable", frozenset({"tcp_connect"})),
     "ike_response": ("reachable", frozenset({"ike"})),
+    "ike_unreachable": ("unreachable", frozenset({"ike"})),
     # UDP/IKE silence cannot distinguish filtering from an unavailable
     # responder, so it must never advance the conclusive failure counter.
     "ike_no_response": ("inconclusive", frozenset({"ike"})),
@@ -418,6 +419,8 @@ def apply_probe_result(
         if previous is not None and normalized["target_generation"] < previous["target_generation"]:
             raise StaleRevisionError("The endpoint target generation is older than stored state.")
         if previous is not None and not generation_changed:
+            if normalized["observed_at"] < previous["last_accepted_at"]:
+                raise StaleCycleError("The endpoint observation timestamp is older than stored state.")
             if normalized["cycle_id"] < previous["cycle_id"]:
                 raise StaleCycleError("The endpoint cycle is older than stored state.")
             if normalized["cycle_id"] == previous["cycle_id"]:

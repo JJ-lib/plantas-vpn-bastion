@@ -394,7 +394,7 @@ def endpoint_admin_diagnostics_enabled():
     return _feature_enabled(ENDPOINT_ADMIN_DIAGNOSTICS_ENV)
 
 ENDPOINT_STATE_LABELS={'healthy':'Saludable','suspect':'Primer fallo pendiente de confirmar','down':'Sin respuesta','unknown':'Sin comprobar','stale':'Comprobación obsoleta','disabled':'Monitorización desactivada'}
-ENDPOINT_CODE_LABELS={'tcp_accept':'Conexión TCP aceptada','tcp_unreachable':'Sin respuesta TCP','ike_response':'Respuesta IKE recibida','ike_no_response':'Sin respuesta IKE','openvpn_udp_response':'Respuesta OpenVPN recibida','udp_port_unreachable':'Puerto UDP rechazado','udp_silent':'Silencio UDP inconcluyente','dns_failed':'Fallo de resolución DNS','dns_failure':'Fallo de resolución DNS','dns_timeout':'Tiempo de resolución agotado','dns_no_answers':'DNS sin respuestas','dns_no_global_address':'DNS sin dirección pública válida','private_or_reserved_destination':'Destino no público','probe_error':'Error de sonda','unsupported_probe':'Sonda no compatible','not_checked':'Sin observación'}
+ENDPOINT_CODE_LABELS={'tcp_accept':'Conexión TCP aceptada','tcp_unreachable':'Sin respuesta TCP','ike_response':'Respuesta IKE recibida','ike_no_response':'Sin respuesta IKE','ike_unreachable':'Sin respuesta IKE concluyente','openvpn_udp_response':'Respuesta OpenVPN recibida','udp_port_unreachable':'Puerto UDP rechazado','udp_silent':'Silencio UDP inconcluyente','dns_failed':'Fallo de resolución DNS','dns_failure':'Fallo de resolución DNS','dns_timeout':'Tiempo de resolución agotado','dns_no_answers':'DNS sin respuestas','dns_no_global_address':'DNS sin dirección pública válida','private_or_reserved_destination':'Destino no público','probe_error':'Error de sonda','unsupported_probe':'Sonda no compatible','not_checked':'Sin observación'}
 
 def endpoint_health_map(vpns):
     ids=[int(v['id']) for v in vpns if v is not None]
@@ -491,8 +491,8 @@ def _monitor_target_from_row(row, *, cycle_id=0, lease_id='pending'):
         if ike not in {'ikev1','ikev2'}:raise ValueError('invalid_ike_version')
         aggressive=bool(int(_row_value(row,'aggressive',0) or 0))
         nat_t=bool(int(_row_value(row,'nat_traversal',0) or 0))
-        expected_port=4500 if nat_t else 500
-        if port != expected_port:raise ValueError('invalid_ipsec_port')
+        allowed_ports = {500, 4500} if nat_t else {500}
+        if port not in allowed_ports:raise ValueError('invalid_ipsec_port')
         config.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
         target.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
     target['target_revision']=target_revision(config)
@@ -516,8 +516,13 @@ def _monitor_json(raw):
 def monitor_targets():
     conn=db(); now=int(time.time()); targets=[]
     try:
+        after_id=max(0,int(request.args.get('after_id','0')))
+        requested_limit=max(1,min(MONITOR_MAX_BATCH,int(request.args.get('limit',MONITOR_MAX_BATCH))))
+    except (TypeError,ValueError):
+        return jsonify(targets=[]),400
+    try:
         conn.execute('BEGIN IMMEDIATE')
-        rows=conn.execute('SELECT * FROM vpns WHERE active=1 ORDER BY id LIMIT ?', (MONITOR_MAX_BATCH,)).fetchall()
+        rows=conn.execute('SELECT * FROM vpns WHERE active=1 AND id>? ORDER BY id LIMIT ?', (after_id,requested_limit)).fetchall()
         for row in rows:
             try:
                 generation=int(_row_value(row,'onboarding_revision',0) or 0)
@@ -533,7 +538,10 @@ def monitor_targets():
         conn.commit()
     except sqlite3.DatabaseError:
         conn.rollback(); return jsonify(targets=[]),503
-    return jsonify(targets=targets)
+    payload={'targets':targets}
+    if len(rows)==requested_limit and rows:
+        payload['next_after_id']=int(rows[-1]['id'])
+    return jsonify(payload)
 
 @app.route('/internal/vpn-endpoint-monitor/results',methods=['POST'])
 @monitor_internal
@@ -544,7 +552,7 @@ def monitor_results():
     if len(raw)>MONITOR_MAX_BODY_BYTES:return jsonify(ok=False,code='request_too_large'),413
     try:payload=_monitor_json(raw)
     except (UnicodeDecodeError,TypeError,ValueError,json.JSONDecodeError):return jsonify(ok=False,code='invalid_request'),400
-    if not isinstance(payload,dict) or set(payload)!={'results'} or not isinstance(payload['results'],list) or not 0<len(payload['results'])<=MONITOR_MAX_BATCH:
+    if not isinstance(payload,dict) or set(payload)!={'results'} or not isinstance(payload['results'],list) or len(payload['results'])>MONITOR_MAX_BATCH:
         return jsonify(ok=False,code='invalid_request'),400
     normalized=[];seen=set()
     for item in payload['results']:

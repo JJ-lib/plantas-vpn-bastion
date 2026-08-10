@@ -1,3 +1,4 @@
+import json
 import socket
 import sys
 import unittest
@@ -16,13 +17,14 @@ from vpn_endpoint_monitor import (
     MAX_PROBE_TIMEOUT_SECONDS,
     ProbeLimits,
     build_ike_scan_argv,
-    classify_ike_scan_output,
+    build_ike_scan_argvs,    classify_ike_scan_output,
     dispatch_probe,
     is_global_unicast,
     validate_target,
     DEFAULT_INTERVAL_SECONDS,
     MAX_WORKERS,
     MAX_HTTP_RESPONSE_BYTES,
+    MAX_MONITOR_BATCH,
     PanelClient,
     bounded_jitter,
     load_monitor_token,
@@ -416,7 +418,7 @@ class IkeScanTests(unittest.TestCase):
         self.assertEqual(argv[0], "ike-scan")
         self.assertIn("--retry=2", argv)
         self.assertIn("--timeout=3000", argv)
-        self.assertIn("--sport=0", argv)
+        self.assertNotIn("--sport=0", argv)
         self.assertIn("--nat-t", argv)
         self.assertIn("--aggressive", argv)
         self.assertIn("--dport=4500", argv)
@@ -436,8 +438,8 @@ class IkeScanTests(unittest.TestCase):
     def test_ike_scan_rejects_non_ike_ports(self):
         with self.assertRaises(ValueError):
             build_ike_scan_argv(self.target(port=1234, nat_t=False))
-        with self.assertRaises(ValueError):
-            build_ike_scan_argv(self.target(port=500, nat_t=True))
+        nat_t_500 = build_ike_scan_argv(self.target(port=500, nat_t=True))
+        self.assertIn("--dport=500", nat_t_500)
 
     def test_ike_scan_rejects_untrusted_host_and_unbounded_timeout(self):
         with self.assertRaises(ValueError):
@@ -666,6 +668,22 @@ class WorkerContractTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             PanelClient("http://panel.test", "synthetic-token-0123456789abcdef", opener=malformed).fetch_targets()
+
+    def test_panel_client_fetches_all_target_pages_over_500(self):
+        requests = []
+        pages = [
+            {"targets": [self.target(index + 1) for index in range(MAX_MONITOR_BATCH)], "next_after_id": MAX_MONITOR_BATCH},
+            {"targets": [self.target(MAX_MONITOR_BATCH + 1)]},
+        ]
+        def opener(request, _timeout=None, **_kwargs):
+            requests.append(request.full_url)
+            payload = pages.pop(0)
+            return mock.Mock(__enter__=lambda self: self, __exit__=lambda *args: None,
+                             read=lambda self, size=-1: json.dumps(payload).encode())
+        client = PanelClient("http://panel.test", "synthetic-token-0123456789abcdef", opener=opener)
+        targets = client.fetch_targets()
+        self.assertEqual(len(targets), MAX_MONITOR_BATCH + 1)
+        self.assertEqual(requests[1].split('?')[1], f"after_id={MAX_MONITOR_BATCH}&limit={MAX_MONITOR_BATCH}")
 
     def test_run_cycle_uses_at_most_four_workers_and_posts_normalized_results(self):
         targets = [self.target(index + 1) for index in range(7)]

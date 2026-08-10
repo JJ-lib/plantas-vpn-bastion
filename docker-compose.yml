@@ -106,7 +106,7 @@ services:
       - guacd
 
   caddy:
-    image: caddy:2-alpine
+    image: ${CADDY_IMAGE:?Set CADDY_IMAGE to an immutable image reference}
     container_name: bastion-caddy
     restart: unless-stopped
     ports:

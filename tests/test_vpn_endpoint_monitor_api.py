@@ -256,7 +256,7 @@ class EndpointMonitorApiTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(tuple(row), ("healthy", 0))
 
-        stale = dict(result, target_revision="0" * 64, public_code="ike_no_response", outcome="unreachable")
+        stale = dict(result, target_revision="0" * 64, public_code="ike_unreachable", outcome="unreachable")
         response = self.client.post(
             "/internal/vpn-endpoint-monitor/results",
             json={"results": [stale]},

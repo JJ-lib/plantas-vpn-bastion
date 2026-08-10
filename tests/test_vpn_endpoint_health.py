@@ -382,6 +382,11 @@ class EndpointHealthBehaviorTests(unittest.TestCase):
             self.apply(cycle_id=1, outcome="unreachable", code="tcp_unreachable")
         self.assertEqual(self.health(now=1_300)["cycle_id"], 2)
 
+    def test_older_observation_timestamp_is_rejected_even_for_a_newer_cycle(self):
+        self.apply(cycle_id=1, observed_at=2_000)
+        with self.assertRaises(StaleCycleError):
+            self.apply(cycle_id=2, observed_at=1_999)
+
     def test_new_generation_resets_state_and_acceptance_is_separate_from_conclusive_time(self):
         self.apply(cycle_id=1, outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
         self.apply(cycle_id=2, outcome="inconclusive", code="probe_error", latency_ms=None, observed_at=1_500)

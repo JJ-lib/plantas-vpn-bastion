@@ -84,7 +84,7 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
         self.assertNotIn("panel.db", monitor_serialized)
 
     def test_caddy_denies_internal_paths_before_panel_catch_all(self):
-        deny = re.search(r"(?ms)^\s*handle\s+/internal/\*\s*\{.*?\n\s*\}", self.caddy_text)
+        deny = re.search(r"(?ms)^\s*handle\s+/internal(?:\s+/internal/\*)?\s*\{.*?\n\s*\}", self.caddy_text)
         self.assertIsNotNone(deny)
         deny_end = deny.end()
         panel_proxy = self.caddy_text.index("reverse_proxy panel:5000")

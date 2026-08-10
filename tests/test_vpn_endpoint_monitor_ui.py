@@ -147,7 +147,7 @@ class EndpointMonitorUiTests(unittest.TestCase):
                 )
 
     def test_two_failures_show_user_alert_without_gateway_details(self):
-        self.apply_result("unreachable", "ike_no_response", count=2)
+        self.apply_result("unreachable", "ike_unreachable", count=2)
         self.login_as(self.viewer_id)
         response = self.client.get("/")
         body = response.get_data(as_text=True)
@@ -159,13 +159,13 @@ class EndpointMonitorUiTests(unittest.TestCase):
         self.assertNotIn("ike_no_response", body)
 
     def test_first_failure_does_not_show_user_alert(self):
-        self.apply_result("unreachable", "ike_no_response")
+        self.apply_result("unreachable", "ike_unreachable")
         self.login_as(self.viewer_id)
         body = self.client.get("/").get_data(as_text=True)
         self.assertNotIn("El servidor público de la VPN no responde", body)
 
     def test_online_tunnel_suppresses_alert_but_admin_sees_discrepancy(self):
-        self.apply_result("unreachable", "ike_no_response", count=2)
+        self.apply_result("unreachable", "ike_unreachable", count=2)
         self.mod.vpn_runtime = lambda _vpn: (True, "198.51.100.20", "")
         self.login_as(1)
         body = self.client.get("/").get_data(as_text=True)
@@ -173,14 +173,14 @@ class EndpointMonitorUiTests(unittest.TestCase):
         self.assertIn("La sonda pública no responde, pero el túnel está activo", body)
 
     def test_success_clears_the_user_alert(self):
-        self.apply_result("unreachable", "ike_no_response", count=2)
+        self.apply_result("unreachable", "ike_unreachable", count=2)
         self.apply_result("reachable", "ike_response")
         self.login_as(self.viewer_id)
         body = self.client.get("/").get_data(as_text=True)
         self.assertNotIn("El servidor público de la VPN no responde", body)
 
     def test_admin_table_exposes_only_normalized_diagnostic_fields(self):
-        self.apply_result("unreachable", "ike_no_response", latency=None, count=2)
+        self.apply_result("unreachable", "ike_unreachable", latency=None, count=2)
         self.login_as(1)
         response = self.client.get("/admin/vpns")
         body = response.get_data(as_text=True)
