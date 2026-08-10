@@ -401,10 +401,11 @@ def endpoint_health_map(vpns):
     return health_for_vpns(db(),ids) if ids else {}
 
 def endpoint_card_alert(health,online,admin_view=False):
-    if not health or health.get('state')!='down' or int(health.get('consecutive_failures') or 0)<2:return ''
+    if not health:return ''
     if online:
         if not endpoint_admin_diagnostics_enabled():return ''
-        return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>" if admin_view else ''
+        return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>" if admin_view and health.get('state')=='down' else ''
+    if not public_alert_eligible(health):return ''
     if not endpoint_public_alerts_enabled():return ''
     return "<div class='endpoint-alert' role='status' aria-live='polite'><strong>El servidor público de la VPN no responde</strong><span>Se han confirmado dos fallos consecutivos.</span></div>"
 
