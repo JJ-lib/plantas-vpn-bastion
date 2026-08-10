@@ -312,3 +312,16 @@ The feature is acceptable when:
 8. no probe changes, restarts, pauses, activates, or regenerates a VPN;
 9. the monitor has no Docker socket, panel database, VPN profile, or VPN credential access;
 10. all existing and new tests pass against the exact immutable release candidate.
+
+## 13. Security review gates before implementation
+
+The following gates are mandatory additions to this design. They override any earlier wording that permits a weaker implementation:
+
+- **DNS rebinding and SSRF:** resolve each hostname once per probe, validate every returned address as a global unicast address, and probe only the exact vetted numeric address. TCP sockets must use numeric-address resolution; subprocess probes must receive the numeric IP, never the original hostname. Reject IPv4-mapped IPv6 private/reserved addresses. The monitor deployment must also have host/network egress policy denying private, link-local, metadata, CGNAT, multicast, and reserved ranges.
+- **IKE evidence:** IKE silence is `inconclusive` unless the exact pinned implementation, source-port behavior, timeout conversion, and configured proposal set make the result conclusive. `ike-scan` timeout values must be converted explicitly from seconds to milliseconds. Source-port-500 probes are serialized and require the minimum capability; unsupported or incomplete proposals cannot produce `down`.
+- **Ordering and idempotency:** endpoint configuration has a monotonic generation, and every accepted result carries a panel-issued cycle/lease identifier. The panel accepts at most one result per VPN, generation, and cycle slot, rejects older cycles atomically, and makes duplicate submissions idempotent. Panel acceptance time is stored separately from worker observation time.
+- **Freshness:** `last_accepted_at` and `last_conclusive_at` are distinct. Public alerts require two fresh conclusive failures from distinct cycles. DNS/system/tool failures and UDP silence are inconclusive and cannot preserve a public alert indefinitely; systemic monitor failures trigger monitor-health suppression.
+- **SQLite concurrency:** every connection configures WAL and `busy_timeout`; state transitions use `BEGIN IMMEDIATE` or an equivalent conditional UPSERT with generation/cycle predicates. File-backed multi-connection and concurrent schema-start tests are required.
+- **Promotion safety:** collection, administrator diagnostics, and ordinary-user card alerts have independent feature flags. `VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED` defaults to `false`. Canary mode accepts an explicit approved target selector and never creates a synthetic production `vpns` row.
+- **Secrets and ingress:** the Compose secret mechanism must specify UID/GID, mode, readability by the non-root monitor, and rotation. Flask authentication remains mandatory. Caddy denies the internal API before imports/catch-all routes; black-box tests cover methods, encoded paths, doubled slashes, and route ordering.
+- **Rollback:** routine rollback removes only monitor artifacts and leaves the additive health table in place. It must not restore the whole panel database or erase concurrent VPN/equipment changes. SQLite backups use the supported backup mechanism, and unrelated container IDs/restart counts are verified unchanged.

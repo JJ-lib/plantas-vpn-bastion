@@ -35,6 +35,19 @@
 - `README.md`, `docs/ARCHITECTURE.md`, `docs/CONFIGURATION.md`, `docs/SECURITY.md` — behavior, evidence limits, configuration, and operational security.
 - `tests/run_full_suite.py` — discovery should include the new test modules automatically; modify only if needed for deterministic ordering/isolation.
 
+## Review gates added before implementation
+
+The independent security review found blocking gaps. No probe or deployment task may be marked complete until these gates are covered by code, tests, and deployment verification:
+
+1. Resolve and validate DNS once, then probe only the exact vetted numeric IP; reject IPv4-mapped private/reserved addresses and enforce host/network egress deny rules.
+2. Treat IKE silence as inconclusive unless pinned `ike-scan` behavior, proposal coverage, source-port handling, and seconds-to-milliseconds timeout conversion are proven; serialize source-port-500 probes.
+3. Add monotonic target generation plus panel-issued cycle/lease IDs; accept one result per VPN/generation/cycle, reject older cycles atomically, and make duplicate submissions idempotent.
+4. Track panel acceptance and conclusive-observation timestamps separately; only fresh failures from distinct cycles can create a public alert. Suppress alerts on systemic monitor/DNS/tool failures.
+5. Configure WAL and `busy_timeout` on every SQLite connection; use immediate/conditional atomic writes and file-backed multi-connection concurrency tests.
+6. Keep collection, admin diagnostics, and ordinary-user alerts behind independent flags; default `VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED=false`; canary selection must be explicit and must not create a production VPN row.
+7. Specify secret UID/GID/mode/rotation, keep Flask auth mandatory, and black-box test Caddy denial for methods, encoded paths, doubled slashes, and route order.
+8. Roll back only monitor artifacts; retain the additive health table and never restore the whole database for routine rollback.
+
 ## Task 1: Persist public-endpoint health with an atomic state machine
 
 **Files:**
