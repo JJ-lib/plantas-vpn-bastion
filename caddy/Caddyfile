@@ -5,6 +5,9 @@
 
 :80 {
     encode gzip zstd
+    handle /internal/* {
+        respond "Not Found" 404
+    }
     import /etc/caddy/conf.d/*.caddy
     handle /guacamole* {
         reverse_proxy guacamole:8080
