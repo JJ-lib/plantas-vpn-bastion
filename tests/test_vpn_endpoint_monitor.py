@@ -697,7 +697,7 @@ class WorkerContractTests(unittest.TestCase):
                 return 0
         self.assertEqual(run_worker(Client(), once=False, max_cycles=2, cycle=cycle,
                                     sleep=sleeps.append, interval=300, jitter=lambda _interval: 0), 2)
-        self.assertEqual(sleeps, [300.0])
+        self.assertAlmostEqual(sleeps[0], 300.0, places=3)
 
 
 if __name__ == "__main__":

@@ -827,7 +827,8 @@ def vpns():
         elif v['onboarding_state']=='verified_pending_activation':actions+=f"<form method=post action=/admin/vpns/{v['id']}/activate style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn primary'>Activar tras revalidar</button></form>"
         actions+=f"<form method=post action=/admin/vpns/{v['id']}/delete style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class=btn onclick='return confirm(&quot;Eliminar VPN, equipos, permisos, configuración y contenedor asociados?&quot;)'>Eliminar VPN</button></form>"
         normalized_runtime_detail='Online' if online else ('Pausada' if status=='Pausada' else 'VPN no disponible')
-        b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(normalized_runtime_detail)}'>{icon} {h(status)}</td><td>{endpoint_health_admin_markup(health_by_id.get(int(v['id'])))}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
+        display_detail = detail if not active else normalized_runtime_detail
+        b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(normalized_runtime_detail)}'>{icon} {h(status)}<br><span class='muted'>{h(display_detail)}</span></td><td>{endpoint_health_admin_markup(health_by_id.get(int(v['id'])))}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
     b+='</table><p class=muted>Los borradores se validan de forma aislada. Solo pasan a activos tras validar control, datos, rutas y destino interno.</p>';return page('VPNs',b)
 
 @app.route('/admin/vpns/<int:i>/activate',methods=['POST'])
