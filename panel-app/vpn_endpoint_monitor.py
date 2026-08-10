@@ -1204,6 +1204,9 @@ __all__ = [
     "load_monitor_token",
     "run_cycle",
     "run_worker",
+    "parse_target_selector",
+    "select_targets",
+    "TARGET_IDS_ENV",
 ]
 
 

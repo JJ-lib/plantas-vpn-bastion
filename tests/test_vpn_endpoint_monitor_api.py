@@ -42,6 +42,7 @@ class EndpointMonitorApiTests(unittest.TestCase):
                 "PANEL_BOOTSTRAP_ADMIN_PASSWORD": "synthetic-test-password-only",
                 "PANEL_TEST_ALLOW_MISSING_CSRF": "1",
                 "VPN_ENDPOINT_MONITOR_TOKEN_FILE": str(cls.token_path),
+                "VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED": "true",
             }
         )
         spec = importlib.util.spec_from_file_location("endpoint_monitor_api_app", PANEL / "app.py")

@@ -227,8 +227,8 @@ class EndpointMonitorUiTests(unittest.TestCase):
             self.assertFalse(self.mod.endpoint_admin_diagnostics_enabled())
             self.login_as(1)
             body = self.client.get("/admin/vpns").get_data(as_text=True)
-            self.assertNotIn("Endpoint público", body)
             self.assertNotIn("Sin respuesta IKE", body)
+            self.assertNotIn("data-endpoint-state", body)
 
     def test_missing_gate_values_are_fail_closed_and_public_alert_default_is_false(self):
         with mock.patch.dict(
