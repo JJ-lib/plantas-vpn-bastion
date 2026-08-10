@@ -8,7 +8,7 @@ from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messa
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
-from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, StaleRevisionError, target_revision, validate_result
+from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
@@ -280,6 +280,16 @@ def ensure_bootstrap_admin(conn,now):
     if len(password)<16 or any(ord(ch)<32 or ord(ch)==127 for ch in password):
         raise RuntimeError('PANEL_BOOTSTRAP_ADMIN_PASSWORD es obligatorio y debe tener al menos 16 caracteres para una base nueva.')
     conn.execute('INSERT INTO users(id,username,password_hash,role,active,created_at) VALUES(1,?,?,?,?,?)',('admin',generate_password_hash(password),'admin',1,now))
+
+def ensure_monitor_lease_schema(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS vpn_endpoint_monitor_leases(
+        vpn_id INTEGER PRIMARY KEY,
+        target_generation INTEGER NOT NULL,
+        cycle_id INTEGER NOT NULL,
+        lease_id TEXT NOT NULL,
+        issued_at INTEGER NOT NULL
+    )""")
+
 def init():
     c=sqlite3.connect(DB); now=datetime.now().isoformat(timespec='seconds')
     for q in [
@@ -317,6 +327,7 @@ def init():
     ensure_openvpn_import_staging(c)
     ensure_onboarding_schema(c)
     ensure_endpoint_health_schema(c)
+    ensure_monitor_lease_schema(c)
     c.execute("UPDATE vpns SET ipsec_engine='libreswan' WHERE ipsec_engine IS NULL OR trim(ipsec_engine)=''")
     c.execute("UPDATE vpns SET ipsec_engine='strongswan' WHERE ike_version='ikev2'")
     c.execute("UPDATE vpns SET dh_groups=dh_group WHERE dh_groups IS NULL OR trim(dh_groups)=''")
@@ -365,6 +376,34 @@ def admin(f):
         if u['role']!='admin': abort(403)
         return f(*a,**kw)
     return w
+
+ENDPOINT_PUBLIC_ALERTS_ENV='VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED'
+def endpoint_public_alerts_enabled():
+    return os.environ.get(ENDPOINT_PUBLIC_ALERTS_ENV,'false').strip().lower() in {'1','true','yes','on'}
+
+ENDPOINT_STATE_LABELS={'healthy':'Saludable','suspect':'Primer fallo pendiente de confirmar','down':'Sin respuesta','unknown':'Sin comprobar','stale':'Comprobación obsoleta','disabled':'Monitorización desactivada'}
+ENDPOINT_CODE_LABELS={'tcp_accept':'Conexión TCP aceptada','tcp_unreachable':'Sin respuesta TCP','ike_response':'Respuesta IKE recibida','ike_no_response':'Sin respuesta IKE','openvpn_udp_response':'Respuesta OpenVPN recibida','udp_port_unreachable':'Puerto UDP rechazado','udp_silent':'Silencio UDP inconcluyente','dns_failed':'Fallo de resolución DNS','dns_failure':'Fallo de resolución DNS','dns_timeout':'Tiempo de resolución agotado','dns_no_answers':'DNS sin respuestas','dns_no_global_address':'DNS sin dirección pública válida','private_or_reserved_destination':'Destino no público','probe_error':'Error de sonda','unsupported_probe':'Sonda no compatible','not_checked':'Sin observación'}
+
+def endpoint_health_map(vpns):
+    ids=[int(v['id']) for v in vpns if v is not None]
+    return health_for_vpns(db(),ids) if ids else {}
+
+def endpoint_card_alert(health,online,admin_view=False):
+    if not health or health.get('state')!='down' or int(health.get('consecutive_failures') or 0)<2:return ''
+    if online:
+        return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>" if admin_view else ''
+    if not endpoint_public_alerts_enabled():return ''
+    return "<div class='endpoint-alert' role='status' aria-live='polite'><strong>El servidor público de la VPN no responde</strong><span>Se han confirmado dos fallos consecutivos.</span></div>"
+
+def endpoint_health_admin_markup(health):
+    health=health or {'state':'unknown','consecutive_failures':0,'public_code':'not_checked','last_checked_at':None,'last_success_at':None,'latency_ms':None}
+    state=str(health.get('state') or 'unknown');label=ENDPOINT_STATE_LABELS.get(state,ENDPOINT_STATE_LABELS['unknown']);code=ENDPOINT_CODE_LABELS.get(str(health.get('public_code') or 'not_checked'),ENDPOINT_CODE_LABELS['probe_error'])
+    def local_time(value):
+        if value is None:return '—'
+        try:return datetime.fromtimestamp(int(value)).strftime('%Y-%m-%d %H:%M:%S')
+        except (TypeError,ValueError,OSError,OverflowError):return '—'
+    failures=max(0,int(health.get('consecutive_failures') or 0));latency='—' if health.get('latency_ms') is None else f"{int(health['latency_ms'])} ms"
+    return f"<div class='endpoint-health' data-endpoint-state='{html.escape(state,quote=True)}'><strong>{html.escape(label)}</strong><span>{html.escape(code)}</span><small>Fallos: {failures} · Última: {local_time(health.get('last_checked_at'))} · Éxito: {local_time(health.get('last_success_at'))} · Latencia: {latency}</small></div>"
 
 MONITOR_TOKEN_FILE_ENV='VPN_ENDPOINT_MONITOR_TOKEN_FILE'
 MONITOR_DEFAULT_TOKEN_FILE='/run/secrets/vpn_endpoint_monitor_token'
@@ -418,7 +457,8 @@ def _monitor_openvpn_transport(row):
                 if proto.startswith('udp'):return 'udp'
     return 'udp'
 
-def _monitor_target_from_row(row):
+def _monitor_target_from_row(row, *, cycle_id=0, lease_id='pending'):
+    target_generation=int(_row_value(row,'onboarding_revision',0) or 0)
     vpn_type=str(_row_value(row,'vpn_type','ssl') or 'ssl').strip().lower()
     if vpn_type not in VPN_TYPES:raise ValueError('unsupported_vpn_type')
     host=str(_row_value(row,'host','') or '').strip().lower().rstrip('.')
@@ -430,7 +470,7 @@ def _monitor_target_from_row(row):
     if not 1<=port<=65535:raise ValueError('invalid_port')
     transport='tcp' if vpn_type in {'ssl','pptp'} else ('udp' if vpn_type=='ipsec' else _monitor_openvpn_transport(row))
     config={'vpn_type':vpn_type,'host':host,'port':port,'transport':transport}
-    target={'vpn_id':int(row['id']),'vpn_type':vpn_type,'host':host,'port':port,'transport':transport,'ike_version':'','aggressive':False,'nat_t':False}
+    target={'vpn_id':int(row['id']),'target_revision':'','target_generation':target_generation,'cycle_id':int(cycle_id),'lease_id':lease_id,'vpn_type':vpn_type,'host':host,'port':port,'transport':transport,'ike_version':'','aggressive':False,'nat_t':False}
     if vpn_type=='ipsec':
         ike=str(_row_value(row,'ike_version','ikev1') or 'ikev1').strip().lower()
         if ike not in {'ikev1','ikev2'}:raise ValueError('invalid_ike_version')
@@ -457,11 +497,22 @@ def _monitor_json(raw):
 @app.route('/internal/vpn-endpoint-monitor/targets',methods=['GET'])
 @monitor_internal
 def monitor_targets():
-    rows=db().execute('SELECT * FROM vpns WHERE active=1 ORDER BY id LIMIT ?', (MONITOR_MAX_BATCH,)).fetchall()
-    targets=[]
-    for row in rows:
-        try:targets.append(_monitor_target_from_row(row))
-        except (TypeError,ValueError,OverflowError):continue
+    conn=db(); now=int(time.time()); targets=[]
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        rows=conn.execute('SELECT * FROM vpns WHERE active=1 ORDER BY id LIMIT ?', (MONITOR_MAX_BATCH,)).fetchall()
+        for row in rows:
+            try:
+                generation=int(_row_value(row,'onboarding_revision',0) or 0)
+                prior=conn.execute('SELECT target_generation,cycle_id FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(int(row['id']),)).fetchone()
+                cycle=(int(prior['cycle_id'])+1 if prior and int(prior['target_generation'])==generation else 1)
+                lease=secrets.token_urlsafe(32)
+                conn.execute('INSERT INTO vpn_endpoint_monitor_leases(vpn_id,target_generation,cycle_id,lease_id,issued_at) VALUES(?,?,?,?,?) ON CONFLICT(vpn_id) DO UPDATE SET target_generation=excluded.target_generation,cycle_id=excluded.cycle_id,lease_id=excluded.lease_id,issued_at=excluded.issued_at',(int(row['id']),generation,cycle,lease,now))
+                targets.append(_monitor_target_from_row(row,cycle_id=cycle,lease_id=lease))
+            except (TypeError,ValueError,OverflowError): continue
+        conn.commit()
+    except sqlite3.DatabaseError:
+        conn.rollback(); return jsonify(targets=[]),503
     return jsonify(targets=targets)
 
 @app.route('/internal/vpn-endpoint-monitor/results',methods=['POST'])
@@ -490,21 +541,30 @@ def monitor_results():
         if len(by_id)!=len(normalized):
             conn.rollback();return jsonify(ok=False,code='target_unavailable'),409
         targets={}
-        for vpn_id in seen:
-            try:target=_monitor_target_from_row(by_id[vpn_id])
+        for row in normalized:
+            vpn=by_id[row['vpn_id']]
+            lease=conn.execute('SELECT * FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(row['vpn_id'],)).fetchone()
+            generation=int(_row_value(vpn,'onboarding_revision',0) or 0)
+            if lease is None or row['target_generation']!=generation:
+                conn.rollback();return jsonify(ok=False,code='stale_target_generation'),409
+            if row['target_generation']!=int(lease['target_generation']) or row['cycle_id']!=int(lease['cycle_id']) or row['lease_id']!=lease['lease_id']:
+                conn.rollback();return jsonify(ok=False,code='invalid_monitor_lease'),409
+            try:target=_monitor_target_from_row(vpn,cycle_id=row['cycle_id'],lease_id=row['lease_id'])
             except (TypeError,ValueError,OverflowError):
                 conn.rollback();return jsonify(ok=False,code='target_unavailable'),409
-            targets[vpn_id]=target
-        for row in normalized:
-            target=targets[row['vpn_id']]
+            targets[row['vpn_id']]=target
             if row['target_revision']!=target['target_revision']:
                 conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
             if row['probe_type']!=_monitor_expected_probe(target):
                 conn.rollback();return jsonify(ok=False,code='probe_type_mismatch'),400
-        for row in normalized:apply_probe_result(conn,row,expected_revision=targets[row['vpn_id']]['target_revision'])
+        for row in normalized:apply_probe_result(conn,row,expected_revision=targets[row['vpn_id']]['target_revision'],expected_generation=targets[row['vpn_id']]['target_generation'])
         conn.commit()
     except StaleRevisionError:
         conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
+    except StaleCycleError:
+        conn.rollback();return jsonify(ok=False,code='stale_cycle'),409
+    except ValueError:
+        conn.rollback();return jsonify(ok=False,code='invalid_monitor_lease'),409
     except sqlite3.DatabaseError:
         conn.rollback();return jsonify(ok=False,code='storage_unavailable'),503
     return jsonify(ok=True,accepted=len(normalized),rejected=0)
@@ -568,7 +628,9 @@ def idx():
             try:online=vpn_runtime(vpn)[0]
             except Exception:online=False
         status='online' if online else 'offline';web=sum(1 for e in items if e['kind']=='WEB');rdp=sum(1 for e in items if e['kind']=='RDP');vnc=sum(1 for e in items if e['kind']=='VNC');href='/plant/'+quote(plant,safe='');equipment_copy='equipo disponible' if len(items)==1 else 'equipos disponibles'
-        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div><div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
+        health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None
+        alert=endpoint_card_alert(health,online,admin_view=me()['role']=='admin')
+        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div>{alert}<div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
     return page('Panel de accesos',b+'</div>')
 @app.route('/plant/<path:plant>')
 @need
@@ -579,9 +641,9 @@ def plant_access(plant):
     if vpn:
         try:online=vpn_runtime(vpn)[0]
         except Exception:online=False
-    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
+    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None;back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
     plant_url=quote(canonical,safe='');head_action=(f"<div class='vpn-restart-control'><button class='vpn-restart-button' type='button' data-restart-url='/plant/{plant_url}/vpn/restart' data-restart-csrf='{h(csrf_token())}' onclick='restartPlantVpn(this)'><span>Reiniciar VPN</span></button><span class='vpn-restart-feedback' id='vpn-restart-feedback' role='status' aria-live='polite'></span></div>" if vpn else '')
-    b=(back+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
+    b=(back+endpoint_card_alert(health,online,admin_view=me()['role']=='admin')+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
     for e in items:
         name=html.escape(e['name']);kind=html.escape(e['kind']);ip=html.escape(e['real_ip']);port=html.escape(str(e['real_port']));desc=html.escape(e['description'] or '—')
         tags=equipment_tag_names(db(),e['id']);tag_sort='|'.join(tag.casefold() for tag in tags);tag_filter=','.join(tag.casefold() for tag in tags);tag_badges=equipment_tag_badges(tags)
@@ -745,6 +807,8 @@ def apply_vpn(v):
 @admin
 def vpns():
     rows=db().execute('SELECT * FROM vpns ORDER BY plant').fetchall();b="<a class='btn primary' href=/admin/vpns/new>Añadir VPN</a><table><tr><th>Planta</th><th>Tipo</th><th>Gateway</th><th>Estado</th><th>IP VPN</th><th></th></tr>"
+    health_by_id=endpoint_health_map(rows)
+    b=b.replace('<th>Estado</th>', '<th>Estado</th><th>Endpoint público</th>', 1)
     for v in rows:
         kind=v['vpn_type'] or 'ssl'
         if kind=='ssl':profile='SSL · openfortivpn'
@@ -762,7 +826,8 @@ def vpns():
             actions+=f"<form method=post action=/admin/vpns/{v['id']}/pause style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn danger' onclick='return confirm(&quot;¿Pausar el contenedor Docker de esta VPN? Se interrumpirán sus accesos WEB/RDP.&quot;)'>Pausar VPN</button></form>"
         elif v['onboarding_state']=='verified_pending_activation':actions+=f"<form method=post action=/admin/vpns/{v['id']}/activate style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn primary'>Activar tras revalidar</button></form>"
         actions+=f"<form method=post action=/admin/vpns/{v['id']}/delete style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class=btn onclick='return confirm(&quot;Eliminar VPN, equipos, permisos, configuración y contenedor asociados?&quot;)'>Eliminar VPN</button></form>"
-        b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(detail)}'>{icon} {h(status)}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
+        normalized_runtime_detail='Online' if online else ('Pausada' if status=='Pausada' else 'VPN no disponible')
+        b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(normalized_runtime_detail)}'>{icon} {h(status)}</td><td>{endpoint_health_admin_markup(health_by_id.get(int(v['id'])))}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
     b+='</table><p class=muted>Los borradores se validan de forma aislada. Solo pasan a activos tras validar control, datos, rutas y destino interno.</p>';return page('VPNs',b)
 
 @app.route('/admin/vpns/<int:i>/activate',methods=['POST'])

@@ -127,6 +127,9 @@ class DestinationPolicyTests(unittest.TestCase):
         target = {
             "vpn_id": 7,
             "target_revision": REVISION,
+            "target_generation": 4,
+            "cycle_id": 9,
+            "lease_id": "lease-9",
             "vpn_type": "ssl",
             "host": "gateway.example.test",
             "port": 443,
@@ -181,6 +184,9 @@ class DestinationPolicyTests(unittest.TestCase):
         self.assertEqual(set(result), {
             "vpn_id",
             "target_revision",
+            "target_generation",
+            "cycle_id",
+            "lease_id",
             "probe_type",
             "outcome",
             "public_code",
@@ -229,12 +235,25 @@ class DestinationPolicyTests(unittest.TestCase):
         self.assertEqual(result["public_code"], "private_or_reserved_destination")
         self.assertEqual(connector.calls, [])
 
+    def test_ipv4_mapped_dns_answer_is_probed_as_numeric_ipv4(self):
+        connector = FakeConnector([FakeStream()])
+        dispatch_probe(
+            self.target(),
+            resolver=FakeResolver(["::ffff:8.8.8.8"]),
+            tcp_connector=connector,
+            clock=FakeClock(),
+        )
+        self.assertEqual(connector.calls[0][0][0], "8.8.8.8")
+
 
 class TargetLimitTests(unittest.TestCase):
     def target(self, **changes):
         target = {
             "vpn_id": 7,
             "target_revision": REVISION,
+            "target_generation": 4,
+            "cycle_id": 9,
+            "lease_id": "lease-9",
             "vpn_type": "ssl",
             "host": "gateway.example.test",
             "port": 443,
@@ -276,6 +295,9 @@ class TargetLimitTests(unittest.TestCase):
         self.assertEqual(set(result), {
             "vpn_id",
             "target_revision",
+            "target_generation",
+            "cycle_id",
+            "lease_id",
             "probe_type",
             "outcome",
             "public_code",
@@ -305,6 +327,9 @@ class TcpProbeTests(unittest.TestCase):
         target = {
             "vpn_id": 8,
             "target_revision": REVISION,
+            "target_generation": 4,
+            "cycle_id": 9,
+            "lease_id": "lease-9",
             "vpn_type": "ssl",
             "host": "gateway.example.test",
             "port": 443,
@@ -361,8 +386,11 @@ class IkeScanTests(unittest.TestCase):
         target = {
             "vpn_id": 9,
             "target_revision": REVISION,
+            "target_generation": 4,
+            "cycle_id": 9,
+            "lease_id": "lease-9",
             "vpn_type": "ipsec",
-            "host": "gateway.example.test",
+            "host": "8.8.8.8",
             "port": 500,
             "transport": "udp",
             "ike_version": "ikev1",
@@ -382,7 +410,7 @@ class IkeScanTests(unittest.TestCase):
         self.assertIn("--nat-t", argv)
         self.assertIn("--aggressive", argv)
         self.assertIn("--dport=4500", argv)
-        self.assertEqual(argv[-1], "gateway.example.test")
+        self.assertEqual(argv[-1], "8.8.8.8")
         self.assertNotIn("--psk", " ".join(argv).lower())
         self.assertNotIn("--username", " ".join(argv).lower())
 
@@ -439,6 +467,9 @@ class IkeScanTests(unittest.TestCase):
         self.assertEqual(set(result), {
             "vpn_id",
             "target_revision",
+            "target_generation",
+            "cycle_id",
+            "lease_id",
             "probe_type",
             "outcome",
             "public_code",
@@ -473,6 +504,9 @@ class OpenVpnUdpProbeTests(unittest.TestCase):
         target = {
             "vpn_id": 10,
             "target_revision": REVISION,
+            "target_generation": 4,
+            "cycle_id": 9,
+            "lease_id": "lease-9",
             "vpn_type": "openvpn",
             "host": "gateway.example.test",
             "port": 1194,
@@ -515,6 +549,9 @@ class DispatcherContractTests(unittest.TestCase):
         target = {
             "vpn_id": 11,
             "target_revision": REVISION,
+            "target_generation": 4,
+            "cycle_id": 9,
+            "lease_id": "lease-9",
             "vpn_type": "unsupported",
             "host": "gateway.example.test",
             "port": 1234,
@@ -527,6 +564,9 @@ class DispatcherContractTests(unittest.TestCase):
         self.assertEqual(set(result), {
             "vpn_id",
             "target_revision",
+            "target_generation",
+            "cycle_id",
+            "lease_id",
             "probe_type",
             "outcome",
             "public_code",

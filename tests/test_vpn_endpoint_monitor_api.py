@@ -146,6 +146,9 @@ class EndpointMonitorApiTests(unittest.TestCase):
             {
                 "vpn_id",
                 "target_revision",
+                "target_generation",
+                "cycle_id",
+                "lease_id",
                 "vpn_type",
                 "host",
                 "port",
@@ -228,6 +231,9 @@ class EndpointMonitorApiTests(unittest.TestCase):
         result = {
             "vpn_id": target["vpn_id"],
             "target_revision": target["target_revision"],
+            "target_generation": target["target_generation"],
+            "cycle_id": target["cycle_id"],
+            "lease_id": target["lease_id"],
             "probe_type": "ike",
             "outcome": "reachable",
             "public_code": "ike_response",
@@ -268,6 +274,9 @@ class EndpointMonitorApiTests(unittest.TestCase):
         result = {
             "vpn_id": target["vpn_id"],
             "target_revision": target["target_revision"],
+            "target_generation": target["target_generation"],
+            "cycle_id": target["cycle_id"],
+            "lease_id": target["lease_id"],
             "probe_type": "tcp_connect" if target["transport"] == "tcp" else "ike",
             "outcome": "reachable",
             "public_code": "tcp_accept" if target["transport"] == "tcp" else "ike_response",

@@ -29,6 +29,9 @@ MAX_PROBE_TIMEOUT_SECONDS = 3.0
 MAX_RETRIES = 2
 MAX_LATENCY_MS = 60_000
 MAX_TARGET_REVISION_LENGTH = 64
+MAX_TARGET_GENERATION = 2**63 - 1
+MAX_CYCLE_ID = 2**63 - 1
+MAX_LEASE_ID_LENGTH = 128
 MAX_VPN_ID = 2**63 - 1
 MAX_DNS_ANSWERS = 32
 MAX_UDP_RESPONSE_BYTES = 4_096
@@ -44,6 +47,9 @@ OUTCOMES = frozenset({"reachable", "unreachable", "inconclusive"})
 RESULT_FIELDS = (
     "vpn_id",
     "target_revision",
+    "target_generation",
+    "cycle_id",
+    "lease_id",
     "probe_type",
     "outcome",
     "public_code",
@@ -163,7 +169,8 @@ def _normalize_host(value: Any) -> str:
         parsed = None
 
     if parsed is not None:
-        return str(parsed)
+        mapped = getattr(parsed, "ipv4_mapped", None)
+        return str(mapped or parsed)
 
     # Hostnames are deliberately ASCII-only.  The panel can provide an IDNA
     # normalized name; accepting arbitrary Unicode here would make the command
@@ -209,6 +216,11 @@ def validate_target(target: Any) -> dict[str, Any]:
     revision = target.get("target_revision")
     if not isinstance(revision, str) or not _REVISION_RE.fullmatch(revision):
         raise ValueError("target_revision is invalid.")
+    target_generation = _strict_int(target.get("target_generation"), "target_generation", 0, MAX_TARGET_GENERATION)
+    cycle_id = _strict_int(target.get("cycle_id"), "cycle_id", 0, MAX_CYCLE_ID)
+    lease_id = target.get("lease_id")
+    if not isinstance(lease_id, str) or not 1 <= len(lease_id) <= MAX_LEASE_ID_LENGTH or not lease_id.isascii():
+        raise ValueError("lease_id is invalid.")
 
     vpn_type = _bounded_text(target.get("vpn_type"), "vpn_type", 32).lower()
     transport = _bounded_text(target.get("transport"), "transport", 16).lower()
@@ -221,6 +233,9 @@ def validate_target(target: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {
         "vpn_id": vpn_id,
         "target_revision": revision,
+        "target_generation": target_generation,
+        "cycle_id": cycle_id,
+        "lease_id": lease_id,
         "vpn_type": vpn_type,
         "host": host,
         "port": port,
@@ -244,15 +259,22 @@ def validate_target(target: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalized_ip(value: Any) -> str | None:
+    try:
+        parsed = ipaddress.ip_address(value)
+    except (TypeError, ValueError):
+        return None
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    return str(mapped or parsed)
+
+
 def is_global_unicast(address: Any) -> bool:
     """Return whether an address is safe to probe as a public destination."""
 
-    if not isinstance(address, str) or not address or "%" in address:
+    normalized = _normalized_ip(address)
+    if normalized is None:
         return False
-    try:
-        parsed = ipaddress.ip_address(address)
-    except ValueError:
-        return False
+    parsed = ipaddress.ip_address(normalized)
     return bool(
         parsed.is_global
         and not parsed.is_loopback
@@ -381,9 +403,8 @@ def _resolve_global_addresses(
         candidate = _address_from_answer(answer)
         if candidate is None:
             continue
-        try:
-            normalized = str(ipaddress.ip_address(candidate))
-        except ValueError:
+        normalized = _normalized_ip(candidate)
+        if normalized is None:
             continue
         if is_global_unicast(normalized) and normalized not in seen:
             eligible.append(normalized)
@@ -411,9 +432,8 @@ def _eligible_supplied_addresses(addresses: Iterable[str]) -> list[str]:
     for candidate in supplied:
         if not isinstance(candidate, str):
             continue
-        try:
-            normalized = str(ipaddress.ip_address(candidate))
-        except ValueError:
+        normalized = _normalized_ip(candidate)
+        if normalized is None:
             continue
         if is_global_unicast(normalized) and normalized not in seen:
             eligible.append(normalized)
@@ -530,6 +550,9 @@ def _dto(
     return {
         "vpn_id": _safe_vpn_id(_raw_target_value(target, "vpn_id")),
         "target_revision": _safe_revision(_raw_target_value(target, "target_revision")),
+        "target_generation": _strict_int(_raw_target_value(target, "target_generation", 0), "target_generation", 0, MAX_TARGET_GENERATION) if isinstance(_raw_target_value(target, "target_generation", 0), int) and not isinstance(_raw_target_value(target, "target_generation", 0), bool) and 0 <= _raw_target_value(target, "target_generation", 0) <= MAX_TARGET_GENERATION else 0,
+        "cycle_id": _strict_int(_raw_target_value(target, "cycle_id", 0), "cycle_id", 0, MAX_CYCLE_ID) if isinstance(_raw_target_value(target, "cycle_id", 0), int) and not isinstance(_raw_target_value(target, "cycle_id", 0), bool) and 0 <= _raw_target_value(target, "cycle_id", 0) <= MAX_CYCLE_ID else 0,
+        "lease_id": _raw_target_value(target, "lease_id", "") if isinstance(_raw_target_value(target, "lease_id", ""), str) and 1 <= len(_raw_target_value(target, "lease_id", "")) <= MAX_LEASE_ID_LENGTH and _raw_target_value(target, "lease_id", "").isascii() else "invalid",
         "probe_type": probe_type or _safe_probe_type(target),
         "outcome": safe_outcome,
         "public_code": safe_code,
@@ -692,12 +715,14 @@ def build_ike_scan_argv(
         raise ValueError("target is not an IPsec UDP endpoint.")
     limits = ProbeLimits(timeout_seconds=timeout_seconds, retries=retries)
 
-    literal = None
     try:
         literal = ipaddress.ip_address(normalized["host"])
     except ValueError:
-        pass
-    if literal is not None and not is_global_unicast(str(literal)):
+        raise ValueError("ike-scan requires a vetted numeric destination.") from None
+    if getattr(literal, "ipv4_mapped", None) is not None:
+        literal = literal.ipv4_mapped
+    normalized = dict(normalized, host=str(literal))
+    if not is_global_unicast(normalized["host"]):
         raise ValueError("ike-scan destination is not global.")
 
     destination_port = 4500 if normalized["nat_t"] else normalized["port"]
