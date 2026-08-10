@@ -45,6 +45,9 @@ MAX_VPN_ID = 2**63 - 1
 MAX_DNS_ANSWERS = 32
 MAX_UDP_RESPONSE_BYTES = 4_096
 MAX_SCANNER_OUTPUT_BYTES = 64 * 1024
+MIN_MONITOR_TOKEN_LENGTH = 32
+MAX_MONITOR_TOKEN_LENGTH = 256
+DEFAULT_PANEL_ALLOWED_HOSTS = frozenset({"panel", "panel.test", "localhost"})
 
 DEFAULT_PROBE_TIMEOUT_SECONDS = MAX_PROBE_TIMEOUT_SECONDS
 DEFAULT_RETRIES = 1
@@ -1238,7 +1241,7 @@ def load_monitor_token(path: str | os.PathLike[str]) -> str:
         token = Path(path).read_bytes().decode("ascii").strip()
     except (OSError, UnicodeError):
         raise ValueError("monitor token is unavailable") from None
-    if not 1 <= len(token) <= 512 or any(ord(char) < 33 or ord(char) > 126 for char in token):
+    if not MIN_MONITOR_TOKEN_LENGTH <= len(token) <= MAX_MONITOR_TOKEN_LENGTH or any(ord(char) < 33 or ord(char) > 126 for char in token):
         raise ValueError("monitor token is invalid")
     return token
 
@@ -1261,13 +1264,20 @@ class PanelClient:
     """Small authenticated client for the two internal monitor endpoints."""
 
     def __init__(self, base_url: str, token: str, *, opener: Callable[..., Any] | None = None,
-                 timeout: float = WORKER_HTTP_TIMEOUT_SECONDS):
+                 timeout: float = WORKER_HTTP_TIMEOUT_SECONDS,
+                 allowed_hosts: Iterable[str] | None = None):
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise ValueError("panel URL is invalid")
-        if not isinstance(token, str) or not token:
+        if (not isinstance(token, str) or
+                not MIN_MONITOR_TOKEN_LENGTH <= len(token) <= MAX_MONITOR_TOKEN_LENGTH or
+                any(ord(char) < 33 or ord(char) > 126 for char in token)):
             raise ValueError("monitor token is invalid")
         parsed = urllib.parse.urlsplit(base_url)
-        if parsed.username or parsed.password or not parsed.hostname:
+        allowed = DEFAULT_PANEL_ALLOWED_HOSTS if allowed_hosts is None else frozenset(
+            host.strip().lower() for host in allowed_hosts if isinstance(host, str) and host.strip()
+        )
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.username or parsed.password or not hostname or hostname not in allowed:
             raise ValueError("panel URL is invalid")
         self.base_url = base_url.rstrip("/")
         self.token = token

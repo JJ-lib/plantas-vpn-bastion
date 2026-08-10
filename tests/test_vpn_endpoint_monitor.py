@@ -603,9 +603,9 @@ class WorkerContractTests(unittest.TestCase):
 
     def test_load_monitor_token_reads_trimmed_token_without_logging(self):
         with mock.patch("vpn_endpoint_monitor.Path") as path_type:
-            path_type.return_value.read_bytes.return_value = b"  synthetic-token-1  \n"
+            path_type.return_value.read_bytes.return_value = b"  synthetic-token-0123456789abcdef  \n"
             path_type.return_value.is_file.return_value = True
-            self.assertEqual(load_monitor_token("/run/secrets/token"), "synthetic-token-1")
+            self.assertEqual(load_monitor_token("/run/secrets/token"), "synthetic-token-0123456789abcdef")
             path_type.return_value.read_bytes.assert_called_once_with()
 
     def test_main_prefers_panel_internal_url_environment_contract(self):
@@ -636,10 +636,10 @@ class WorkerContractTests(unittest.TestCase):
                 read=lambda self, size=-1: b'{"targets": []}',
             )
 
-        client = PanelClient("http://panel.test", "synthetic-token", opener=opener)
+        client = PanelClient("http://panel.test", "synthetic-token-0123456789abcdef", opener=opener)
         self.assertEqual(client.fetch_targets(), [])
         request, timeout = requests[0]
-        self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-token")
+        self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-token-0123456789abcdef")
         self.assertEqual(request.method, "GET")
         self.assertLessEqual(timeout, 3.0)
 
@@ -649,7 +649,7 @@ class WorkerContractTests(unittest.TestCase):
                 __enter__=lambda self: self, __exit__=lambda *args: None,
                 read=lambda self, size=-1: b"x" * (MAX_HTTP_RESPONSE_BYTES + 1),
             )
-        client = PanelClient("http://panel.test", "token", opener=oversized)
+        client = PanelClient("http://panel.test", "synthetic-token-0123456789abcdef", opener=oversized)
         with self.assertRaises(ValueError):
             client.fetch_targets()
 
@@ -659,7 +659,7 @@ class WorkerContractTests(unittest.TestCase):
                 read=lambda self, size=-1: b'{"targets": [{"host": "bad"}]}'
             )
         with self.assertRaises(ValueError):
-            PanelClient("http://panel.test", "token", opener=malformed).fetch_targets()
+            PanelClient("http://panel.test", "synthetic-token-0123456789abcdef", opener=malformed).fetch_targets()
 
     def test_run_cycle_uses_at_most_four_workers_and_posts_normalized_results(self):
         targets = [self.target(index + 1) for index in range(7)]
