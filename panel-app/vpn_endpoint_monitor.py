@@ -1364,7 +1364,13 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VPN public endpoint monitor")
-    parser.add_argument("--panel-url", default=os.environ.get("PANEL_URL", "http://panel:5000"))
+    parser.add_argument(
+        "--panel-url",
+        default=os.environ.get(
+            "PANEL_INTERNAL_URL",
+            os.environ.get("PANEL_URL", "http://panel:5000"),
+        ),
+    )
     parser.add_argument("--token-file", default=os.environ.get("VPN_ENDPOINT_MONITOR_TOKEN_FILE", "/run/secrets/vpn_endpoint_monitor_token"))
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
