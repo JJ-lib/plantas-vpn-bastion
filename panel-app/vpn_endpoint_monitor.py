@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -774,7 +775,10 @@ def classify_ike_scan_output(
     combined = (text(stdout) + "\n" + text(stderr))[:MAX_SCANNER_OUTPUT_BYTES]
     if any(pattern.search(combined) for pattern in _IKE_RESPONSE_PATTERNS):
         return {"outcome": "reachable", "public_code": "ike_response"}
-    return {"outcome": "unreachable", "public_code": "ike_no_response"}
+    # A credential-free IKE scan cannot distinguish a filtered UDP packet from
+    # an unavailable gateway. Silence is therefore inconclusive and must not
+    # advance the public endpoint failure counter.
+    return {"outcome": "inconclusive", "public_code": "ike_no_response"}
 
 
 def _runner_function(runner: Any) -> Callable[..., Any]:
@@ -867,6 +871,7 @@ def probe_ike(
 
     started = _clock_monotonic(clock)
     saw_tool_failure = False
+    saw_inconclusive = False
     for address in eligible:
         scan_target = dict(normalized, host=address)
         try:
@@ -896,16 +901,21 @@ def probe_ike(
                     clock=clock,
                     probe_type="ike",
                 )
+            if classification["outcome"] == "inconclusive":
+                saw_inconclusive = True
             if classification["public_code"] == "probe_error":
                 saw_tool_failure = True
         except (subprocess.TimeoutExpired, TimeoutError, socket.timeout):
-            # For IKE only, bounded silence/timeout is a conclusive no-response.
+            # UDP filtering and responder silence are not conclusive evidence.
+            saw_inconclusive = True
             continue
         except Exception:
             saw_tool_failure = True
 
     if saw_tool_failure:
         outcome, code = "inconclusive", "probe_error"
+    elif saw_inconclusive:
+        outcome, code = "inconclusive", "ike_no_response"
     else:
         outcome, code = "unreachable", "ike_no_response"
     return _dto(
@@ -1256,9 +1266,18 @@ class PanelClient:
             raise ValueError("panel URL is invalid")
         if not isinstance(token, str) or not token:
             raise ValueError("monitor token is invalid")
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.username or parsed.password or not parsed.hostname:
+            raise ValueError("panel URL is invalid")
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self.opener = opener or urllib.request.urlopen
+        if opener is None:
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+            self.opener = urllib.request.build_opener(_NoRedirect()).open
+        else:
+            self.opener = opener
         self.timeout = min(max(float(timeout), 0.1), WORKER_HTTP_TIMEOUT_SECONDS)
 
     def _request(self, method: str, path: str, payload: Any = None) -> Any:

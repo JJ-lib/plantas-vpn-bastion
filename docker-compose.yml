@@ -42,11 +42,11 @@ services:
     secrets:
       - source: monitor_token
         target: monitor-token
-        uid: "10001"
-        gid: "10001"
+        uid: "65532"
+        gid: "65532"
         mode: "0440"
     read_only: true
-    user: "10001:10001"
+    user: "65532:65532"
     cap_drop:
       - ALL
     security_opt:

@@ -452,7 +452,7 @@ class IkeScanTests(unittest.TestCase):
 
         self.assertEqual(handshake, {"outcome": "reachable", "public_code": "ike_response"})
         self.assertEqual(notify, {"outcome": "reachable", "public_code": "ike_response"})
-        self.assertEqual(silence, {"outcome": "unreachable", "public_code": "ike_no_response"})
+        self.assertEqual(silence, {"outcome": "inconclusive", "public_code": "ike_no_response"})
         self.assertNotIn("raw", repr(notify))
 
     def test_ike_probe_uses_shell_false_timeout_and_only_normalized_dto(self):

@@ -137,8 +137,15 @@ def enc(x): return F.encrypt((x or '').encode()).decode()
 def dec(x):
     try: return F.decrypt((x or '').encode()).decode() if x else ''
     except Exception: return ''
+def _connect_db():
+    conn=sqlite3.connect(DB, timeout=5.0)
+    conn.execute('PRAGMA busy_timeout=5000')
+    try: conn.execute('PRAGMA journal_mode=WAL')
+    except sqlite3.DatabaseError: pass
+    conn.row_factory=sqlite3.Row
+    return conn
 def db():
-    if 'db' not in g: g.db=sqlite3.connect(DB); g.db.row_factory=sqlite3.Row
+    if 'db' not in g: g.db=_connect_db()
     return g.db
 _vpn_lock_local=threading.local()
 class vpn_slug_lock:
@@ -291,7 +298,7 @@ def ensure_monitor_lease_schema(conn):
     )""")
 
 def init():
-    c=sqlite3.connect(DB); now=datetime.now().isoformat(timespec='seconds')
+    c=_connect_db(); now=datetime.now().isoformat(timespec='seconds')
     for q in [
     'CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT, role TEXT, active INTEGER, created_at TEXT)',
     'CREATE TABLE IF NOT EXISTS equipment(id INTEGER PRIMARY KEY, plant TEXT, name TEXT, kind TEXT, real_ip TEXT, real_port TEXT, path TEXT, public_url TEXT, description TEXT, active INTEGER, created_at TEXT, vpn_id INTEGER)',
@@ -517,9 +524,12 @@ def monitor_targets():
                 prior=conn.execute('SELECT target_generation,cycle_id FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(int(row['id']),)).fetchone()
                 cycle=(int(prior['cycle_id'])+1 if prior and int(prior['target_generation'])==generation else 1)
                 lease=secrets.token_urlsafe(32)
+                target=_monitor_target_from_row(row,cycle_id=cycle,lease_id=lease)
                 conn.execute('INSERT INTO vpn_endpoint_monitor_leases(vpn_id,target_generation,cycle_id,lease_id,issued_at) VALUES(?,?,?,?,?) ON CONFLICT(vpn_id) DO UPDATE SET target_generation=excluded.target_generation,cycle_id=excluded.cycle_id,lease_id=excluded.lease_id,issued_at=excluded.issued_at',(int(row['id']),generation,cycle,lease,now))
-                targets.append(_monitor_target_from_row(row,cycle_id=cycle,lease_id=lease))
-            except (TypeError,ValueError,OverflowError): continue
+                targets.append(target)
+            except (TypeError,ValueError,OverflowError):
+                conn.rollback()
+                return jsonify(targets=[]), 503
         conn.commit()
     except sqlite3.DatabaseError:
         conn.rollback(); return jsonify(targets=[]),503
