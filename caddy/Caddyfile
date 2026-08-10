@@ -5,7 +5,7 @@
 
 :80 {
     encode gzip zstd
-    handle /internal/* {
+    handle /internal /internal/* {
         respond "Not Found" 404
     }
     import /etc/caddy/conf.d/*.caddy
