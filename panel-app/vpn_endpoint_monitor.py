@@ -9,14 +9,22 @@ raw diagnostic material is ever returned.
 
 from __future__ import annotations
 
+import argparse
 import errno
 import inspect
 import ipaddress
+import json
 import math
+import os
+from pathlib import Path
+import random
 import re
 import socket
 import subprocess
+import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
@@ -1188,4 +1196,191 @@ __all__ = [
     "probe_udp",
     "resolve_global_addresses",
     "validate_target",
+    "DEFAULT_INTERVAL_SECONDS",
+    "MAX_WORKERS",
+    "MAX_HTTP_RESPONSE_BYTES",
+    "PanelClient",
+    "bounded_jitter",
+    "load_monitor_token",
+    "run_cycle",
+    "run_worker",
 ]
+
+
+# Task 4 worker loop.  This boundary deliberately uses only stdlib HTTP and
+# bounded in-memory state; failures are retried by the next cycle, never queued.
+DEFAULT_INTERVAL_SECONDS = 300.0
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 4
+MAX_HTTP_RESPONSE_BYTES = 64 * 1024
+MAX_HTTP_REQUEST_BYTES = 64 * 1024
+MAX_BACKOFF_SECONDS = 600.0
+WORKER_HTTP_TIMEOUT_SECONDS = 3.0
+
+
+def load_monitor_token(path: str | os.PathLike[str]) -> str:
+    """Read a deployment token without exposing it in logs or exceptions."""
+    try:
+        token = Path(path).read_bytes().decode("ascii").strip()
+    except (OSError, UnicodeError):
+        raise ValueError("monitor token is unavailable") from None
+    if not 1 <= len(token) <= 512 or any(ord(char) < 33 or ord(char) > 126 for char in token):
+        raise ValueError("monitor token is invalid")
+    return token
+
+
+def _read_bounded(response: Any, limit: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    body = response.read(limit + 1)
+    if not isinstance(body, bytes) or len(body) > limit:
+        raise ValueError("panel response exceeds the size limit")
+    return body
+
+
+def _decode_json(body: bytes) -> Any:
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("panel response is not valid JSON") from None
+
+
+class PanelClient:
+    """Small authenticated client for the two internal monitor endpoints."""
+
+    def __init__(self, base_url: str, token: str, *, opener: Callable[..., Any] | None = None,
+                 timeout: float = WORKER_HTTP_TIMEOUT_SECONDS):
+        if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+            raise ValueError("panel URL is invalid")
+        if not isinstance(token, str) or not token:
+            raise ValueError("monitor token is invalid")
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.opener = opener or urllib.request.urlopen
+        self.timeout = min(max(float(timeout), 0.1), WORKER_HTTP_TIMEOUT_SECONDS)
+
+    def _request(self, method: str, path: str, payload: Any = None) -> Any:
+        data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if data is not None and len(data) > MAX_HTTP_REQUEST_BYTES:
+            raise ValueError("panel request exceeds the size limit")
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        # Pass timeout positionally so injected openers can stay tiny and
+        # urllib.request.urlopen remains the only production HTTP dependency.
+        with self.opener(request, self.timeout) as response:
+            return _decode_json(_read_bounded(response))
+
+    def fetch_targets(self) -> list[dict[str, Any]]:
+        payload = self._request("GET", "/internal/vpn-endpoint-monitor/targets")
+        if not isinstance(payload, dict) or not isinstance(payload.get("targets"), list):
+            raise ValueError("panel target schema is invalid")
+        targets = payload["targets"]
+        if len(targets) > 256:
+            raise ValueError("panel target count exceeds the size limit")
+        normalized = []
+        for target in targets:
+            normalized.append(validate_target(target))
+        return normalized
+
+    def post_results(self, results: list[Mapping[str, Any]]) -> Any:
+        if not isinstance(results, list) or len(results) > 256:
+            raise ValueError("panel result count exceeds the size limit")
+        for result in results:
+            if not isinstance(result, Mapping) or set(result) != set(RESULT_FIELDS):
+                raise ValueError("panel result schema is invalid")
+        payload = self._request("POST", "/internal/vpn-endpoint-monitor/results", {"results": results})
+        if not isinstance(payload, dict):
+            raise ValueError("panel result schema is invalid")
+        return payload
+
+
+def bounded_jitter(interval: float, *, random_value: float | None = None) -> float:
+    """Return jitter bounded to ten percent and never more than thirty seconds."""
+    interval = min(max(float(interval), 1.0), MAX_BACKOFF_SECONDS)
+    value = random.uniform(-1.0, 1.0) if random_value is None else float(random_value)
+    if not math.isfinite(value):
+        value = 0.0
+    value = min(max(value, -1.0), 1.0)
+    return value * min(30.0, interval * 0.1)
+
+
+def run_cycle(client: PanelClient, *, probe: Callable[[Mapping[str, Any]], Mapping[str, Any]] = dispatch_probe,
+              workers: int = DEFAULT_WORKERS) -> int:
+    """Fetch one bounded target snapshot, probe it, and submit normalized DTOs."""
+    targets = client.fetch_targets()
+    if isinstance(workers, bool) or not isinstance(workers, int):
+        raise ValueError("workers must be an integer")
+    worker_count = min(max(workers, 1), MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="vpn-monitor") as executor:
+        results = list(executor.map(probe, targets))
+    client.post_results(results)
+    return len(results)
+
+
+def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEFAULT_INTERVAL_SECONDS,
+               workers: int = DEFAULT_WORKERS, timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+               sleep: Callable[[float], Any] = time.sleep, jitter: Callable[[float], float] = bounded_jitter,
+               cycle: Callable[..., int] = run_cycle, max_cycles: int | None = None,
+               monotonic: Callable[[], float] = time.monotonic) -> int:
+    """Run immediately, then at a bounded interval; panel failures do not queue data."""
+    try:
+        interval = float(interval)
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        raise ValueError("interval and timeout must be numeric") from None
+    if not math.isfinite(interval) or not math.isfinite(timeout):
+        raise ValueError("interval and timeout must be finite")
+    interval = min(max(interval, 1.0), MAX_BACKOFF_SECONDS)
+    timeout = min(max(timeout, 0.1), MAX_PROBE_TIMEOUT_SECONDS)
+    completed = 0
+    failure_streak = 0
+    while True:
+        try:
+            cycle(client, workers=workers, probe=lambda target: dispatch_probe(
+                target, limits=ProbeLimits(timeout_seconds=timeout)))
+        except Exception:
+            # Deliberately no exception text: it may contain URL/token details.
+            failure_streak = min(failure_streak + 1, 2)
+        else:
+            failure_streak = 0
+        completed += 1
+        if once or (max_cycles is not None and completed >= max_cycles):
+            return completed
+        backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** max(0, failure_streak - 1)))
+        delay = min(MAX_BACKOFF_SECONDS, max(1.0, backoff + float(jitter(backoff))))
+        deadline = monotonic() + delay
+        # Account for cycle execution time so a slow cycle cannot create an
+        # unbounded scheduling drift.  The deadline is monotonic, never wall
+        # clock based, and the sleep remains bounded even after clock jumps.
+        delay = min(MAX_BACKOFF_SECONDS, max(1.0, deadline - monotonic()))
+        sleep(delay)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="VPN public endpoint monitor")
+    parser.add_argument("--panel-url", default=os.environ.get("PANEL_URL", "http://panel:5000"))
+    parser.add_argument("--token-file", default=os.environ.get("VPN_ENDPOINT_MONITOR_TOKEN_FILE", "/run/secrets/vpn_endpoint_monitor_token"))
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_PROBE_TIMEOUT_SECONDS)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        client = PanelClient(args.panel_url, load_monitor_token(args.token_file))
+        run_worker(client, once=args.once, interval=args.interval, workers=args.workers, timeout=args.timeout)
+    except Exception:
+        # Never print exception text: it can contain deployment URLs or secret
+        # material supplied by an HTTP/auth implementation.
+        print("vpn endpoint monitor failed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

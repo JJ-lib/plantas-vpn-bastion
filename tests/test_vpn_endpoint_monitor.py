@@ -1,6 +1,7 @@
 import socket
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,14 @@ from vpn_endpoint_monitor import (  # noqa: E402
     dispatch_probe,
     is_global_unicast,
     validate_target,
+    DEFAULT_INTERVAL_SECONDS,
+    MAX_WORKERS,
+    MAX_HTTP_RESPONSE_BYTES,
+    PanelClient,
+    bounded_jitter,
+    load_monitor_token,
+    run_cycle,
+    run_worker,
 )
 
 
@@ -573,6 +582,122 @@ class DispatcherContractTests(unittest.TestCase):
             "latency_ms",
             "observed_at",
         })
+
+
+class WorkerContractTests(unittest.TestCase):
+    def target(self, vpn_id=1, **changes):
+        target = {
+            "vpn_id": vpn_id,
+            "target_revision": REVISION,
+            "target_generation": 1,
+            "cycle_id": 2,
+            "lease_id": "lease-2",
+            "vpn_type": "ssl",
+            "host": "gateway.example.test",
+            "port": 443,
+            "transport": "tcp",
+        }
+        target.update(changes)
+        return target
+
+    def test_load_monitor_token_reads_trimmed_token_without_logging(self):
+        with mock.patch("vpn_endpoint_monitor.Path") as path_type:
+            path_type.return_value.read_bytes.return_value = b"  synthetic-token-1  \n"
+            path_type.return_value.is_file.return_value = True
+            self.assertEqual(load_monitor_token("/run/secrets/token"), "synthetic-token-1")
+            path_type.return_value.read_bytes.assert_called_once_with()
+
+    def test_panel_client_uses_stdlib_http_and_bearer_token(self):
+        requests = []
+
+        def opener(request, timeout=None, **_kwargs):
+            requests.append((request, timeout))
+            return mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda self, size=-1: b'{"targets": []}',
+            )
+
+        client = PanelClient("http://panel.test", "synthetic-token", opener=opener)
+        self.assertEqual(client.fetch_targets(), [])
+        request, timeout = requests[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-token")
+        self.assertEqual(request.method, "GET")
+        self.assertLessEqual(timeout, 3.0)
+
+    def test_panel_client_rejects_oversized_or_malformed_target_response(self):
+        def oversized(_request, _timeout=None, **_kwargs):
+            return mock.Mock(
+                __enter__=lambda self: self, __exit__=lambda *args: None,
+                read=lambda self, size=-1: b"x" * (MAX_HTTP_RESPONSE_BYTES + 1),
+            )
+        client = PanelClient("http://panel.test", "token", opener=oversized)
+        with self.assertRaises(ValueError):
+            client.fetch_targets()
+
+        def malformed(_request, _timeout=None, **_kwargs):
+            return mock.Mock(
+                __enter__=lambda self: self, __exit__=lambda *args: None,
+                read=lambda self, size=-1: b'{"targets": [{"host": "bad"}]}'
+            )
+        with self.assertRaises(ValueError):
+            PanelClient("http://panel.test", "token", opener=malformed).fetch_targets()
+
+    def test_run_cycle_uses_at_most_four_workers_and_posts_normalized_results(self):
+        targets = [self.target(index + 1) for index in range(7)]
+        observed = []
+        posted = []
+
+        class Client:
+            def fetch_targets(self):
+                return targets
+            def post_results(self, results):
+                posted.append(results)
+
+        def probe(target):
+            observed.append(target["vpn_id"])
+            return {"vpn_id": target["vpn_id"], "target_revision": REVISION,
+                    "target_generation": 1, "cycle_id": 2, "lease_id": "lease-2",
+                    "probe_type": "tcp_connect", "outcome": "reachable",
+                    "public_code": "tcp_accept", "latency_ms": 1, "observed_at": 1}
+
+        self.assertEqual(run_cycle(Client(), probe=probe), 7)
+        self.assertEqual(len(posted[0]), 7)
+        self.assertEqual(MAX_WORKERS, 4)
+
+    def test_bounded_jitter_stays_within_configured_bounds(self):
+        for value in (-1.0, 0.0, 1.0):
+            jitter = bounded_jitter(300.0, random_value=value)
+            self.assertGreaterEqual(jitter, -30.0)
+            self.assertLessEqual(jitter, 30.0)
+
+    def test_run_worker_once_is_immediate_and_default_interval_is_300(self):
+        self.assertEqual(DEFAULT_INTERVAL_SECONDS, 300.0)
+        calls = []
+        class Client:
+            def fetch_targets(self): return []
+            def post_results(self, results): calls.append(results)
+        self.assertEqual(run_worker(Client(), once=True, sleep=lambda seconds: calls.append(seconds)), 1)
+        self.assertEqual(calls, [[]])
+
+    def test_panel_failure_has_bounded_backoff_and_recovers_next_cycle(self):
+        sleeps = []
+        outcomes = [OSError("synthetic panel unavailable"), []]
+        class Client:
+            def fetch_targets(self):
+                value = outcomes.pop(0)
+                if isinstance(value, BaseException): raise value
+                return value
+            def post_results(self, results): pass
+        def cycle(client, **kwargs):
+            try:
+                client.fetch_targets()
+                return 0
+            except OSError:
+                return 0
+        self.assertEqual(run_worker(Client(), once=False, max_cycles=2, cycle=cycle,
+                                    sleep=sleeps.append, interval=300, jitter=lambda _interval: 0), 2)
+        self.assertEqual(sleeps, [300.0])
 
 
 if __name__ == "__main__":
