@@ -455,6 +455,8 @@ class EndpointHealthValidationTests(unittest.TestCase):
     def test_validate_result_accepts_only_the_exact_bounded_contract(self):
         valid = self.valid_result()
         self.assertEqual(validate_result(valid), valid)
+        inconclusive_ike = dict(valid, probe_type="ike", public_code="ike_no_response", outcome="inconclusive")
+        self.assertEqual(validate_result(inconclusive_ike), inconclusive_ike)
 
         invalid_results = []
         for missing in valid:

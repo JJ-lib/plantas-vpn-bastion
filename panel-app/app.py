@@ -8,7 +8,7 @@ from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messa
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
-from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, StaleRevisionError, StaleCycleError, target_revision, validate_result
+from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, public_alert_eligible, configure_sqlite_connection, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
@@ -138,10 +138,7 @@ def dec(x):
     try: return F.decrypt((x or '').encode()).decode() if x else ''
     except Exception: return ''
 def _connect_db():
-    conn=sqlite3.connect(DB, timeout=5.0)
-    conn.execute('PRAGMA busy_timeout=5000')
-    try: conn.execute('PRAGMA journal_mode=WAL')
-    except sqlite3.DatabaseError: pass
+    conn=configure_sqlite_connection(sqlite3.connect(DB, timeout=5.0))
     conn.row_factory=sqlite3.Row
     return conn
 def db():
@@ -493,6 +490,8 @@ def _monitor_target_from_row(row, *, cycle_id=0, lease_id='pending'):
         if ike not in {'ikev1','ikev2'}:raise ValueError('invalid_ike_version')
         aggressive=bool(int(_row_value(row,'aggressive',0) or 0))
         nat_t=bool(int(_row_value(row,'nat_traversal',0) or 0))
+        expected_port=4500 if nat_t else 500
+        if port != expected_port:raise ValueError('invalid_ipsec_port')
         config.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
         target.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
     target['target_revision']=target_revision(config)

@@ -33,6 +33,9 @@ services:
   vpn-endpoint-monitor:
     image: ${MONITOR_IMAGE:?Set MONITOR_IMAGE to an immutable image reference}
     container_name: bastion-vpn-endpoint-monitor
+    labels:
+      com.plantas-vpn-bastion.egress-policy: deny-private-linklocal-cgnat-reserved
+      com.plantas-vpn-bastion.egress-policy-required: "true"
     restart: unless-stopped
     command: ["python", "-m", "vpn_endpoint_monitor", "--interval", "300"]
     environment:
@@ -120,6 +123,8 @@ services:
 networks:
   bastion:
     name: bastion_net
+    labels:
+      com.plantas-vpn-bastion.monitor-egress-policy: deny-private-linklocal-cgnat-reserved
 
 volumes:
   caddy_data:

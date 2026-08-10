@@ -737,11 +737,16 @@ def build_ike_scan_argv(
     if not is_global_unicast(normalized["host"]):
         raise ValueError("ike-scan destination is not global.")
 
-    destination_port = 4500 if normalized["nat_t"] else normalized["port"]
+    # IKE uses the standards-defined destination ports only.  Never turn a
+    # deployment row's arbitrary service port into an IKE probe destination.
+    expected_port = 4500 if normalized["nat_t"] else 500
+    if normalized["port"] != expected_port:
+        raise ValueError("IPsec endpoint must use UDP/500 or UDP/4500 for NAT-T.")
+    destination_port = expected_port
     argv = [
         "ike-scan",
         f"--retry={limits.retries}",
-        f"--timeout={_format_timeout(limits.timeout_seconds)}",
+        f"--timeout={_format_timeout(limits.timeout_seconds * 1000)}",
         "--sport=0",
         f"--dport={destination_port}",
     ]

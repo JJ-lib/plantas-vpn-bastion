@@ -13,7 +13,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Mapping
 
 
 HEALTH_STATES = frozenset(
@@ -55,7 +55,9 @@ _PUBLIC_CODE_RULES = {
     "tcp_accept": ("reachable", frozenset({"tcp_connect"})),
     "tcp_unreachable": ("unreachable", frozenset({"tcp_connect"})),
     "ike_response": ("reachable", frozenset({"ike"})),
-    "ike_no_response": ("unreachable", frozenset({"ike"})),
+    # UDP/IKE silence cannot distinguish filtering from an unavailable
+    # responder, so it must never advance the conclusive failure counter.
+    "ike_no_response": ("inconclusive", frozenset({"ike"})),
     "openvpn_udp_response": ("reachable", frozenset({"openvpn_udp"})),
     "udp_port_unreachable": ("unreachable", frozenset({"openvpn_udp"})),
     "udp_silent": ("inconclusive", frozenset({"openvpn_udp"})),
@@ -328,6 +330,17 @@ def validate_result(result: Any) -> dict[str, Any]:
     }
 
 
+def configure_sqlite_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Apply the panel's file-backed concurrency settings to one connection."""
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError:
+        # In-memory databases and active transactions cannot always switch mode.
+        pass
+    return conn
+
+
 @contextmanager
 def _write_transaction(conn: sqlite3.Connection, savepoint: str):
     outer_transaction = conn.in_transaction
@@ -351,13 +364,7 @@ def _write_transaction(conn: sqlite3.Connection, savepoint: str):
 def ensure_endpoint_health_schema(conn: sqlite3.Connection) -> None:
     """Create the endpoint-health table without changing VPN lifecycle data."""
 
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.DatabaseError:
-        # An in-memory DB and an already-open transaction may not change modes.
-        pass
-
+    configure_sqlite_connection(conn)
     with _write_transaction(conn, "endpoint_health_schema"):
         conn.execute(_SCHEMA_SQL)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
@@ -569,3 +576,14 @@ def health_for_vpns(
             item["state"] = "stale"
         health[item["vpn_id"]] = item
     return health
+
+
+def public_alert_eligible(health: Mapping[str, Any] | None) -> bool:
+    """Return true only for fresh, conclusive evidence from the latest cycle."""
+    if not health or health.get("state") != "down":
+        return False
+    if int(health.get("consecutive_failures") or 0) < 2:
+        return False
+    checked = health.get("last_checked_at")
+    conclusive = health.get("last_conclusive_at")
+    return checked is not None and conclusive == checked and not bool(health.get("is_stale"))

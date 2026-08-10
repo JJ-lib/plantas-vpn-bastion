@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
        ca-certificates \
-       ike-scan=1.9.5-3.1+b1 \
+       ike-scan=1.9.5-2 \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system --gid 65532 monitor \
     && adduser --system --uid 65532 --gid 65532 --no-create-home monitor \

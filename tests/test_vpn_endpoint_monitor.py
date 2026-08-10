@@ -401,7 +401,7 @@ class IkeScanTests(unittest.TestCase):
             "lease_id": "lease-9",
             "vpn_type": "ipsec",
             "host": "8.8.8.8",
-            "port": 500,
+            "port": 4500,
             "transport": "udp",
             "ike_version": "ikev1",
             "aggressive": True,
@@ -415,7 +415,7 @@ class IkeScanTests(unittest.TestCase):
 
         self.assertEqual(argv[0], "ike-scan")
         self.assertIn("--retry=2", argv)
-        self.assertIn("--timeout=3", argv)
+        self.assertIn("--timeout=3000", argv)
         self.assertIn("--sport=0", argv)
         self.assertIn("--nat-t", argv)
         self.assertIn("--aggressive", argv)
@@ -425,13 +425,19 @@ class IkeScanTests(unittest.TestCase):
         self.assertNotIn("--username", " ".join(argv).lower())
 
         ikev2 = build_ike_scan_argv(
-            self.target(ike_version="ikev2", aggressive=False, nat_t=False),
+            self.target(ike_version="ikev2", aggressive=False, nat_t=False, port=500),
             timeout_seconds=1.5,
             retries=1,
         )
         self.assertIn("--ikev2", ikev2)
         self.assertNotIn("--aggressive", ikev2)
         self.assertIn("--dport=500", ikev2)
+
+    def test_ike_scan_rejects_non_ike_ports(self):
+        with self.assertRaises(ValueError):
+            build_ike_scan_argv(self.target(port=1234, nat_t=False))
+        with self.assertRaises(ValueError):
+            build_ike_scan_argv(self.target(port=500, nat_t=True))
 
     def test_ike_scan_rejects_untrusted_host_and_unbounded_timeout(self):
         with self.assertRaises(ValueError):
