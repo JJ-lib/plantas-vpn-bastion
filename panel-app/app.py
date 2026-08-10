@@ -8,6 +8,7 @@ from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messa
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
+from vpn_endpoint_health import ensure_endpoint_health_schema
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
@@ -315,6 +316,7 @@ def init():
     migrate_vpn_access_columns(c)
     ensure_openvpn_import_staging(c)
     ensure_onboarding_schema(c)
+    ensure_endpoint_health_schema(c)
     c.execute("UPDATE vpns SET ipsec_engine='libreswan' WHERE ipsec_engine IS NULL OR trim(ipsec_engine)=''")
     c.execute("UPDATE vpns SET ipsec_engine='strongswan' WHERE ike_version='ikev2'")
     c.execute("UPDATE vpns SET dh_groups=dh_group WHERE dh_groups IS NULL OR trim(dh_groups)=''")
