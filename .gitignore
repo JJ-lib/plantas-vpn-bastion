@@ -55,4 +55,5 @@ dist/
 # Deployment-only iterations
 staging/
 release-candidates/
+.worktrees/
 .onboarding-owner
