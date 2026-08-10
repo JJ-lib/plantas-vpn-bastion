@@ -1,14 +1,14 @@
 import threading
 import fcntl,functools
 
-import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json
+import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json, hmac, stat
 from urllib.parse import quote
 from datetime import datetime
 from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messages,Response,has_request_context,jsonify
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
-from vpn_endpoint_health import ensure_endpoint_health_schema
+from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, StaleRevisionError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
@@ -365,6 +365,150 @@ def admin(f):
         if u['role']!='admin': abort(403)
         return f(*a,**kw)
     return w
+
+MONITOR_TOKEN_FILE_ENV='VPN_ENDPOINT_MONITOR_TOKEN_FILE'
+MONITOR_DEFAULT_TOKEN_FILE='/run/secrets/vpn_endpoint_monitor_token'
+MONITOR_TOKEN_MIN_BYTES=32
+MONITOR_TOKEN_MAX_BYTES=256
+MONITOR_MAX_BODY_BYTES=64*1024
+MONITOR_MAX_BATCH=500
+
+def _monitor_token_bytes():
+    path=os.environ.get(MONITOR_TOKEN_FILE_ENV,'').strip() or MONITOR_DEFAULT_TOKEN_FILE
+    if len(path)>4096 or '\0' in path:return None
+    try:
+        info=os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size>MONITOR_TOKEN_MAX_BYTES:return None
+        if os.name!='nt' and info.st_mode & 0o022:return None
+        with open(path,'rb') as fh:raw=fh.read(MONITOR_TOKEN_MAX_BYTES+1)
+    except (OSError,ValueError):return None
+    raw=raw.rstrip(bytes((13,10)))
+    if not MONITOR_TOKEN_MIN_BYTES<=len(raw)<=MONITOR_TOKEN_MAX_BYTES:return None
+    if any(byte<33 or byte>126 for byte in raw):return None
+    return raw
+
+def _monitor_authorized():
+    header=request.headers.get('Authorization','')
+    if not isinstance(header,str) or not header.startswith('Bearer '):return False
+    try:provided=header[7:].encode('ascii')
+    except UnicodeEncodeError:return False
+    expected=_monitor_token_bytes()
+    return expected is not None and hmac.compare_digest(provided,expected)
+
+def monitor_internal(f):
+    @functools.wraps(f)
+    def wrapped(*args,**kwargs):
+        if not _monitor_authorized():abort(404)
+        return f(*args,**kwargs)
+    return wrapped
+
+def _row_value(row,name,default=None):
+    try:return row[name]
+    except (IndexError,KeyError):return default
+
+def _monitor_openvpn_transport(row):
+    profile=_row_value(row,'openvpn_profile_enc','')
+    if profile:
+        decoded=dec(profile)
+        for raw_line in decoded.splitlines():
+            parts=raw_line.strip().split()
+            if len(parts)>=2 and parts[0].lower()=='proto':
+                proto=parts[1].lower()
+                if proto.startswith('tcp'):return 'tcp'
+                if proto.startswith('udp'):return 'udp'
+    return 'udp'
+
+def _monitor_target_from_row(row):
+    vpn_type=str(_row_value(row,'vpn_type','ssl') or 'ssl').strip().lower()
+    if vpn_type not in VPN_TYPES:raise ValueError('unsupported_vpn_type')
+    host=str(_row_value(row,'host','') or '').strip().lower().rstrip('.')
+    if not 1<=len(host)<=253 or any(ord(ch)<33 or ord(ch)==127 for ch in host):raise ValueError('invalid_host')
+    port_value=_row_value(row,'port','')
+    if isinstance(port_value,bool):raise ValueError('invalid_port')
+    try:port=int(str(port_value).strip(),10)
+    except (TypeError,ValueError):raise ValueError('invalid_port')
+    if not 1<=port<=65535:raise ValueError('invalid_port')
+    transport='tcp' if vpn_type in {'ssl','pptp'} else ('udp' if vpn_type=='ipsec' else _monitor_openvpn_transport(row))
+    config={'vpn_type':vpn_type,'host':host,'port':port,'transport':transport}
+    target={'vpn_id':int(row['id']),'vpn_type':vpn_type,'host':host,'port':port,'transport':transport,'ike_version':'','aggressive':False,'nat_t':False}
+    if vpn_type=='ipsec':
+        ike=str(_row_value(row,'ike_version','ikev1') or 'ikev1').strip().lower()
+        if ike not in {'ikev1','ikev2'}:raise ValueError('invalid_ike_version')
+        aggressive=bool(int(_row_value(row,'aggressive',0) or 0))
+        nat_t=bool(int(_row_value(row,'nat_traversal',0) or 0))
+        config.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
+        target.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
+    target['target_revision']=target_revision(config)
+    return target
+
+def _monitor_expected_probe(target):
+    if target['vpn_type']=='ipsec':return 'ike'
+    return 'tcp_connect' if target['transport']=='tcp' else 'openvpn_udp'
+
+def _monitor_json(raw):
+    def pairs(items):
+        result={}
+        for key,value in items:
+            if key in result:raise ValueError('duplicate_json_key')
+            result[key]=value
+        return result
+    return json.loads(raw.decode('utf-8'),object_pairs_hook=pairs,parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+
+@app.route('/internal/vpn-endpoint-monitor/targets',methods=['GET'])
+@monitor_internal
+def monitor_targets():
+    rows=db().execute('SELECT * FROM vpns WHERE active=1 ORDER BY id LIMIT ?', (MONITOR_MAX_BATCH,)).fetchall()
+    targets=[]
+    for row in rows:
+        try:targets.append(_monitor_target_from_row(row))
+        except (TypeError,ValueError,OverflowError):continue
+    return jsonify(targets=targets)
+
+@app.route('/internal/vpn-endpoint-monitor/results',methods=['POST'])
+@monitor_internal
+def monitor_results():
+    if request.content_length is not None and request.content_length>MONITOR_MAX_BODY_BYTES:
+        return jsonify(ok=False,code='request_too_large'),413
+    raw=request.get_data(cache=False)
+    if len(raw)>MONITOR_MAX_BODY_BYTES:return jsonify(ok=False,code='request_too_large'),413
+    try:payload=_monitor_json(raw)
+    except (UnicodeDecodeError,TypeError,ValueError,json.JSONDecodeError):return jsonify(ok=False,code='invalid_request'),400
+    if not isinstance(payload,dict) or set(payload)!={'results'} or not isinstance(payload['results'],list) or not 0<len(payload['results'])<=MONITOR_MAX_BATCH:
+        return jsonify(ok=False,code='invalid_request'),400
+    normalized=[];seen=set()
+    for item in payload['results']:
+        try:row=validate_result(item)
+        except (TypeError,ValueError):return jsonify(ok=False,code='invalid_result'),400
+        if row['vpn_id'] in seen:return jsonify(ok=False,code='duplicate_vpn_id'),400
+        seen.add(row['vpn_id']);normalized.append(row)
+    conn=db()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        placeholders=','.join('?' for _ in normalized)
+        rows=conn.execute(f'SELECT * FROM vpns WHERE active=1 AND id IN ({placeholders})',tuple(seen)).fetchall()
+        by_id={int(row['id']):row for row in rows}
+        if len(by_id)!=len(normalized):
+            conn.rollback();return jsonify(ok=False,code='target_unavailable'),409
+        targets={}
+        for vpn_id in seen:
+            try:target=_monitor_target_from_row(by_id[vpn_id])
+            except (TypeError,ValueError,OverflowError):
+                conn.rollback();return jsonify(ok=False,code='target_unavailable'),409
+            targets[vpn_id]=target
+        for row in normalized:
+            target=targets[row['vpn_id']]
+            if row['target_revision']!=target['target_revision']:
+                conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
+            if row['probe_type']!=_monitor_expected_probe(target):
+                conn.rollback();return jsonify(ok=False,code='probe_type_mismatch'),400
+        for row in normalized:apply_probe_result(conn,row,expected_revision=targets[row['vpn_id']]['target_revision'])
+        conn.commit()
+    except StaleRevisionError:
+        conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
+    except sqlite3.DatabaseError:
+        conn.rollback();return jsonify(ok=False,code='storage_unavailable'),503
+    return jsonify(ok=True,accepted=len(normalized),rejected=0)
+
 S=r"""
 :root{--canvas:#f5f5f5;--paper:#fff;--surface:#fafafa;--ink:#0a0a0a;--ink-soft:#171717;--muted:#737373;--hairline:#e5e5e5;--success:#16a34a;--danger:#e7000b;--card-radius:24px;--control-radius:18px;--shadow:0 0 0 1px rgba(23,23,23,.05),0 1px 3px rgba(0,0,0,.10),0 1px 2px -1px rgba(0,0,0,.10)}
 [data-theme='dark']{--canvas:#0a0a0a;--paper:#171717;--surface:#111;--ink:#fafafa;--ink-soft:#e5e5e5;--muted:#a3a3a3;--hairline:#2f2f2f;--success:#4ade80;--danger:#ff4d55;--shadow:0 0 0 1px rgba(255,255,255,.08),0 1px 3px rgba(0,0,0,.45),0 1px 2px -1px rgba(0,0,0,.5)}
