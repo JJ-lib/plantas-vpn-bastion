@@ -77,6 +77,7 @@ _PUBLIC_CODES = frozenset(
         "tcp_accept",
         "tcp_unreachable",
         "ike_response",
+        "udp_response",
         "ike_no_response",
         "ike_unreachable",
         "openvpn_udp_response",
@@ -844,14 +845,28 @@ def probe_ike(
     addresses: Iterable[str] | None = None,
     resolver: Any = None,
     runner: Any = None,
+    udp_socket_factory: Any = None,
+    socket_factory: Any = None,
     clock: Any = None,
     limits: ProbeLimits | None = None,
 ) -> dict[str, Any]:
-    """Run a bounded, allowlisted IKE scan against eligible addresses."""
+    """Use an unprivileged UDP port probe in production; keep IKE scan injection for tests/admin tooling."""
 
     try:
         normalized = validate_target(target)
         active_limits = limits or ProbeLimits()
+        if runner is None:
+            return probe_udp_port(
+                normalized,
+                addresses=addresses,
+                resolver=resolver,
+                udp_socket_factory=udp_socket_factory,
+                socket_factory=socket_factory,
+                clock=clock,
+                limits=active_limits,
+                probe_type="ike",
+                response_code="udp_response",
+            )
         if _probe_type_for(normalized) != "ike":
             return _dto(
                 normalized,
@@ -961,7 +976,33 @@ def _is_udp_refused(error: BaseException) -> bool:
     return value == errno.ECONNREFUSED or winerror == 10061
 
 
-def probe_openvpn_udp(
+def _udp_ports_for_target(normalized: Mapping[str, Any]) -> tuple[int, ...]:
+    """Return the public UDP ports to test for one normalized target."""
+    if normalized.get("vpn_type") == "ipsec" and normalized.get("nat_t"):
+        # NAT-T starts on UDP/500 and may continue on UDP/4500. Test both;
+        # one response is enough to prove that the public service answers.
+        return tuple(dict.fromkeys((500, 4500)))
+    return (int(normalized["port"]),)
+
+
+def _ipsec_udp_payload(target: Mapping[str, Any], port: int) -> bytes:
+    """Build a credential-free, minimal IKE header for a UDP port check."""
+    ikev2 = target.get("ike_version") == "ikev2"
+    header = bytes.fromhex(
+        "0102030405060708"
+        + "00" * 8
+        + "00"
+        + ("20" if ikev2 else "10")
+        + ("22" if ikev2 else "02")
+        + ("08" if ikev2 else "00")
+        + "00" * 4
+        + "0000001c"
+    )
+    # RFC 3948 uses a four-byte non-ESP marker on UDP/4500.
+    return (bytes(4) + header) if port == 4500 else header
+
+
+def probe_udp_port(
     target: Mapping[str, Any],
     *,
     addresses: Iterable[str] | None = None,
@@ -970,20 +1011,31 @@ def probe_openvpn_udp(
     socket_factory: Any = None,
     clock: Any = None,
     limits: ProbeLimits | None = None,
+    probe_type: str = "openvpn_udp",
+    response_code: str = "openvpn_udp_response",
 ) -> dict[str, Any]:
-    """Send a credential-free UDP probe and preserve silence as inconclusive."""
+    """Check public UDP service reachability without privileged/raw sockets."""
 
     try:
         normalized = validate_target(target)
         active_limits = limits or ProbeLimits()
-        if _probe_type_for(normalized) != "openvpn_udp":
+        supported = (
+            probe_type == "ike"
+            and normalized.get("vpn_type") == "ipsec"
+            and normalized.get("transport") == "udp"
+        ) or (
+            probe_type == "openvpn_udp"
+            and normalized.get("vpn_type") == "openvpn"
+            and normalized.get("transport") == "udp"
+        )
+        if not supported:
             return _dto(
                 normalized,
                 outcome="inconclusive",
                 public_code="unsupported_probe",
                 latency_ms=None,
                 clock=clock,
-                probe_type="openvpn_udp",
+                probe_type=probe_type,
             )
         eligible = _eligible_supplied_addresses(addresses) if addresses is not None else _resolve_global_addresses(
             normalized["host"],
@@ -993,6 +1045,7 @@ def probe_openvpn_udp(
         )
         if not eligible:
             raise _ResolutionProblem("dns_no_global_address")
+        ports = _udp_ports_for_target(normalized)
     except _ResolutionProblem as problem:
         return _dto(
             target,
@@ -1000,7 +1053,7 @@ def probe_openvpn_udp(
             public_code=problem.public_code,
             latency_ms=None,
             clock=clock,
-            probe_type="openvpn_udp",
+            probe_type=probe_type,
         )
     except Exception:
         return _dto(
@@ -1009,7 +1062,7 @@ def probe_openvpn_udp(
             public_code="probe_error",
             latency_ms=None,
             clock=clock,
-            probe_type="openvpn_udp",
+            probe_type=probe_type,
         )
 
     factory = udp_socket_factory if udp_socket_factory is not None else socket_factory
@@ -1019,46 +1072,48 @@ def probe_openvpn_udp(
     saw_tool_failure = False
     for address in eligible:
         family = socket.AF_INET6 if ":" in address else socket.AF_INET
-        udp_socket = None
-        try:
-            udp_socket = _make_udp_socket(factory, family)
-            settimeout = getattr(udp_socket, "settimeout", None)
-            if not callable(settimeout):
-                raise OSError()
-            settimeout(float(active_limits.timeout_seconds))
-            connect = getattr(udp_socket, "connect", None)
-            send = getattr(udp_socket, "send", None)
-            recv = getattr(udp_socket, "recv", None)
-            if not all(callable(function) for function in (connect, send, recv)):
-                raise OSError()
-            connect((address, normalized["port"]))
-            send(_OPENVPN_UDP_PROBE_PAYLOAD)
-            response = recv(MAX_UDP_RESPONSE_BYTES)
-            if isinstance(response, (bytes, bytearray)) and response:
-                return _dto(
-                    normalized,
-                    outcome="reachable",
-                    public_code="openvpn_udp_response",
-                    latency_ms=_bounded_latency_ms(
-                        clock, started, active_limits.max_latency_ms
-                    ),
-                    clock=clock,
-                    probe_type="openvpn_udp",
+        for port in ports:
+            udp_socket = None
+            try:
+                udp_socket = _make_udp_socket(factory, family)
+                settimeout = getattr(udp_socket, "settimeout", None)
+                connect = getattr(udp_socket, "connect", None)
+                send = getattr(udp_socket, "send", None)
+                recv = getattr(udp_socket, "recv", None)
+                if not all(callable(function) for function in (settimeout, connect, send, recv)):
+                    raise OSError()
+                settimeout(float(active_limits.timeout_seconds))
+                connect((address, port))
+                payload = (
+                    _ipsec_udp_payload(normalized, port)
+                    if normalized.get("vpn_type") == "ipsec"
+                    else _OPENVPN_UDP_PROBE_PAYLOAD
                 )
-            saw_silence = True
-        except (socket.timeout, TimeoutError):
-            saw_silence = True
-        except OSError as error:
-            if _is_udp_refused(error):
-                saw_refused = True
-            else:
+                send(payload)
+                response = recv(MAX_UDP_RESPONSE_BYTES)
+                if isinstance(response, (bytes, bytearray)) and response:
+                    return _dto(
+                        normalized,
+                        outcome="reachable",
+                        public_code=response_code,
+                        latency_ms=_bounded_latency_ms(clock, started, active_limits.max_latency_ms),
+                        clock=clock,
+                        probe_type=probe_type,
+                    )
+                saw_silence = True
+            except (socket.timeout, TimeoutError):
+                saw_silence = True
+            except OSError as error:
+                if _is_udp_refused(error):
+                    saw_refused = True
+                else:
+                    saw_tool_failure = True
+            except Exception:
                 saw_tool_failure = True
-        except Exception:
-            saw_tool_failure = True
-        finally:
-            close = getattr(udp_socket, "close", None)
-            if callable(close):
-                close()
+            finally:
+                close = getattr(udp_socket, "close", None)
+                if callable(close):
+                    close()
 
     if saw_silence:
         outcome, code = "inconclusive", "udp_silent"
@@ -1074,7 +1129,31 @@ def probe_openvpn_udp(
         public_code=code,
         latency_ms=_bounded_latency_ms(clock, started, active_limits.max_latency_ms),
         clock=clock,
+        probe_type=probe_type,
+    )
+
+
+def probe_openvpn_udp(
+    target: Mapping[str, Any],
+    *,
+    addresses: Iterable[str] | None = None,
+    resolver: Any = None,
+    udp_socket_factory: Any = None,
+    socket_factory: Any = None,
+    clock: Any = None,
+    limits: ProbeLimits | None = None,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the generic OpenVPN UDP port probe."""
+    return probe_udp_port(
+        target,
+        addresses=addresses,
+        resolver=resolver,
+        udp_socket_factory=udp_socket_factory,
+        socket_factory=socket_factory,
+        clock=clock,
+        limits=limits,
         probe_type="openvpn_udp",
+        response_code="openvpn_udp_response",
     )
 
 
@@ -1147,6 +1226,8 @@ def dispatch_probe(
                 normalized,
                 addresses=addresses,
                 runner=runner,
+                udp_socket_factory=udp_socket_factory,
+                socket_factory=socket_factory,
                 clock=clock,
                 limits=active_limits,
             )
@@ -1207,6 +1288,7 @@ __all__ = [
     "is_global_unicast",
     "probe_ike",
     "probe_openvpn_udp",
+    "probe_udp_port",
     "probe_tcp",
     "probe_udp",
     "resolve_global_addresses",

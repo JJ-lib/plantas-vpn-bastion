@@ -462,6 +462,10 @@ class EndpointHealthValidationTests(unittest.TestCase):
         self.assertEqual(validate_result(valid), valid)
         inconclusive_ike = dict(valid, probe_type="ike", public_code="ike_no_response", outcome="inconclusive")
         self.assertEqual(validate_result(inconclusive_ike), inconclusive_ike)
+        udp_ike = dict(valid, probe_type="ike", public_code="udp_response", outcome="reachable")
+        self.assertEqual(validate_result(udp_ike), udp_ike)
+        silent_ike = dict(valid, probe_type="ike", public_code="udp_silent", outcome="inconclusive")
+        self.assertEqual(validate_result(silent_ike), silent_ike)
 
         invalid_results = []
         for missing in valid:

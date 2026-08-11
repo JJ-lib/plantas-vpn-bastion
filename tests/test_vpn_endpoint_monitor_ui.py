@@ -187,7 +187,10 @@ class EndpointMonitorUiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Endpoint público", body)
         self.assertIn("data-endpoint-state='down'", body)
-        self.assertIn("Sin respuesta IKE", body)
+        self.assertIn("Puerto UDP no accesible", body)
+        self.assertIn("endpoint-health-meta", body)
+        self.assertIn("<dt>Fallos consecutivos</dt>", body)
+        self.assertNotIn("Fallos: 2 · Última:", body)
         self.assertIn("vpn.example.test:500", body)
         self.assertNotIn("sealed-password", body)
         self.assertNotIn("synthetic tunnel offline", body)
@@ -227,8 +230,8 @@ class EndpointMonitorUiTests(unittest.TestCase):
             self.assertFalse(self.mod.endpoint_admin_diagnostics_enabled())
             self.login_as(1)
             body = self.client.get("/admin/vpns").get_data(as_text=True)
-            self.assertNotIn("Sin respuesta IKE", body)
-            self.assertNotIn("data-endpoint-state", body)
+            self.assertNotIn("Puerto UDP no accesible", body)
+            self.assertNotIn("class='endpoint-health'", body)
 
     def test_missing_gate_values_are_fail_closed_and_public_alert_default_is_false(self):
         with mock.patch.dict(

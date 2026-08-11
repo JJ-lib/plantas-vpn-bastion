@@ -516,6 +516,32 @@ class IkeScanTests(unittest.TestCase):
         self.assertEqual(result["public_code"], "probe_error")
         self.assertNotIn("secret", repr(result))
 
+    def test_ipsec_production_path_checks_udp_500_and_nat_t_4500_without_raw_sockets(self):
+        sock = FakeUDPSocket(recv_result=b"udp-response")
+        factory = FakeSocketFactory(sock)
+        result = dispatch_probe(
+            self.target(),
+            resolver=FakeResolver(["8.8.8.8"]),
+            udp_socket_factory=factory,
+            clock=FakeClock(),
+        )
+
+        self.assertEqual((result["probe_type"], result["outcome"], result["public_code"]), ("ike", "reachable", "udp_response"))
+        self.assertEqual(len(factory.calls), 1)
+        self.assertTrue(sock.sent)
+        self.assertTrue(sock.closed)
+
+    def test_ipsec_udp_silence_is_inconclusive_not_a_probe_error(self):
+        sock = FakeUDPSocket(recv_error=socket.timeout())
+        result = dispatch_probe(
+            self.target(),
+            resolver=FakeResolver(["8.8.8.8"]),
+            udp_socket_factory=FakeSocketFactory(sock),
+            clock=FakeClock(),
+        )
+
+        self.assertEqual((result["probe_type"], result["outcome"], result["public_code"]), ("ike", "inconclusive", "udp_silent"))
+
 
 class OpenVpnUdpProbeTests(unittest.TestCase):
     def target(self, **changes):

@@ -55,13 +55,14 @@ _PUBLIC_CODE_RULES = {
     "tcp_accept": ("reachable", frozenset({"tcp_connect"})),
     "tcp_unreachable": ("unreachable", frozenset({"tcp_connect"})),
     "ike_response": ("reachable", frozenset({"ike"})),
+    "udp_response": ("reachable", frozenset({"ike", "openvpn_udp"})),
     "ike_unreachable": ("unreachable", frozenset({"ike"})),
     # UDP/IKE silence cannot distinguish filtering from an unavailable
     # responder, so it must never advance the conclusive failure counter.
     "ike_no_response": ("inconclusive", frozenset({"ike"})),
     "openvpn_udp_response": ("reachable", frozenset({"openvpn_udp"})),
-    "udp_port_unreachable": ("unreachable", frozenset({"openvpn_udp"})),
-    "udp_silent": ("inconclusive", frozenset({"openvpn_udp"})),
+    "udp_port_unreachable": ("unreachable", frozenset({"ike", "openvpn_udp"})),
+    "udp_silent": ("inconclusive", frozenset({"ike", "openvpn_udp"})),
     "dns_failed": ("inconclusive", PROBE_TYPES),
     "dns_failure": ("inconclusive", PROBE_TYPES),
     "dns_timeout": ("inconclusive", PROBE_TYPES),
