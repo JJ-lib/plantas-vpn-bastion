@@ -5,6 +5,6 @@
   "files": ["README.md", "docs/**/*.md", "CONTRIBUTING.md", "SECURITY.md", "SUPPORT.md", "CHANGELOG.md", "ROADMAP.md"],
   "ignorePaths": ["docs/superpowers/**", "guacamole-server/**"],
   "words": [
-    "Bastión", "Guacamole", "HAProxy", "OpenFortiVPN", "strongSwan", "Libreswan", "guacd", "Caddy", "SCADA", "WebSocket", "OT-adjacent", "RFC1918", "PSK", "Fernet", "fail-closed", "canary", "namespaces", "reconciler", "root-relative", "plant-specific", "CLIPRDR", "Dockerfiles", "GUAC", "askpass", "compileall", "ovpn", "plantas", "unredacted", "vpnctl", "webfix"
+    "Bastión", "Guacamole", "HAProxy", "OpenFortiVPN", "strongSwan", "Libreswan", "guacd", "Caddy", "SCADA", "WebSocket", "OT-adjacent", "RFC1918", "PSK", "Fernet", "fail-closed", "canary", "namespaces", "reconciler", "root-relative", "plant-specific", "CLIPRDR", "Dockerfiles", "GUAC", "askpass", "compileall", "ovpn", "plantas", "unredacted", "vpnctl", "webfix", "CGNAT", "cgnat", "linklocal"
   ]
 }
