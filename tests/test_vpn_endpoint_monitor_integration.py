@@ -22,14 +22,16 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
         cls.caddy_text = CADDY_PATH.read_text(encoding="utf-8")
         cls.env_text = ENV_PATH.read_text(encoding="utf-8")
 
-    def test_monitor_uses_immutable_image_and_five_minute_interval(self):
+    def test_monitor_uses_immutable_image_and_sixty_second_interval(self):
         self.assertEqual(
             self.monitor["image"],
             "${MONITOR_IMAGE:?Set MONITOR_IMAGE to an immutable image reference}",
         )
         command = self.monitor["command"]
-        self.assertIn("300", command)
-        self.assertEqual(command[command.index("--interval") + 1], "300")
+        self.assertIn("60", command)
+        self.assertEqual(command[command.index("--interval") + 1], "60")
+        self.assertNotIn("300", command)
+        self.assertEqual(self.monitor["healthcheck"]["test"][-1], "--healthcheck")
 
     def test_monitor_has_no_database_docker_project_or_host_access(self):
         serialized = repr(self.monitor).lower()
@@ -47,6 +49,7 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
         user = str(self.monitor["user"])
         self.assertRegex(user, r"^(?:[1-9][0-9]*)(?::[1-9][0-9]*)?$")
         self.assertEqual(self.monitor["cap_drop"], ["ALL"])
+        self.assertEqual(self.monitor["cap_add"], ["NET_RAW"])
         self.assertIn("no-new-privileges:true", self.monitor["security_opt"])
 
         tmpfs = self.monitor["tmpfs"]

@@ -596,12 +596,14 @@ def monitor_results():
     except (UnicodeDecodeError,TypeError,ValueError,json.JSONDecodeError):return jsonify(ok=False,code='invalid_request'),400
     if not isinstance(payload,dict) or set(payload)!={'results'} or not isinstance(payload['results'],list) or len(payload['results'])>MONITOR_MAX_BATCH:
         return jsonify(ok=False,code='invalid_request'),400
-    normalized=[];seen=set()
+    normalized=[];seen=set();lease_fields={'target_generation','cycle_id','lease_id'}
     for item in payload['results']:
         try:row=validate_result(item)
         except (TypeError,ValueError):return jsonify(ok=False,code='invalid_result'),400
-        if not {'target_generation','cycle_id','lease_id'} <= set(item):
-            row['_minimal_contract']=True
+        supplied_lease_fields=lease_fields & set(item)
+        if supplied_lease_fields and supplied_lease_fields != lease_fields:
+            return jsonify(ok=False,code='invalid_result'),400
+        row['_minimal_contract']=not supplied_lease_fields
         if row['vpn_id'] in seen:return jsonify(ok=False,code='duplicate_vpn_id'),400
         seen.add(row['vpn_id']);normalized.append(row)
     conn=db()
@@ -617,8 +619,15 @@ def monitor_results():
             vpn=by_id[row['vpn_id']]
             lease=conn.execute('SELECT * FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(row['vpn_id'],)).fetchone()
             generation=int(_row_value(vpn,'onboarding_revision',0) or 0)
-            if lease is None or row['target_generation']!=generation:
+            if lease is None:
                 conn.rollback();return jsonify(ok=False,code='stale_target_generation'),409
+            if row.get('_minimal_contract'):
+                row['target_generation']=generation
+                row['cycle_id']=int(lease['cycle_id'])
+                row['lease_id']=str(lease['lease_id'])
+            elif row['target_generation']!=generation:
+                conn.rollback();return jsonify(ok=False,code='stale_target_generation'),409
+            row.pop('_minimal_contract',None)
             if row['target_generation']!=int(lease['target_generation']) or row['cycle_id']!=int(lease['cycle_id']) or row['lease_id']!=lease['lease_id']:
                 conn.rollback();return jsonify(ok=False,code='invalid_monitor_lease'),409
             try:target=_monitor_target_from_row(vpn,cycle_id=row['cycle_id'],lease_id=row['lease_id'])
@@ -1262,7 +1271,8 @@ def vpn_edit(i):
             reset_inactive_vpn_draft(v2)
         except (ValueError,sqlite3.IntegrityError) as e:return page('Editar VPN '+kind.upper(),vf(v,kind,str(e))),400
         flash('Borrador actualizado; volverá a validarse de forma aislada.');return redirect('/admin/vpns')
-    return page('Editar VPN '+kind.upper(),vf(v,kind))
+    health=endpoint_health_map([v]).get(int(v['id']))
+    return page('Editar VPN '+kind.upper(),vf(v,kind)+endpoint_health_admin_markup(health)+endpoint_history_admin_markup(i))
 
 def ensure_haproxy(sl, plant):
     hp=f'{BASE}/configs/{sl}/haproxy.cfg'

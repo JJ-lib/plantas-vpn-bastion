@@ -55,7 +55,7 @@ DEFAULT_RETRIES = 1
 
 SUPPORTED_VPN_TYPES = frozenset({"ssl", "openvpn", "pptp", "ipsec"})
 SUPPORTED_TRANSPORTS = frozenset({"tcp", "udp"})
-SUPPORTED_PROBE_TYPES = frozenset({"tcp_connect", "ike", "openvpn_udp"})
+SUPPORTED_PROBE_TYPES = frozenset({"tcp", "ike", "openvpn_udp"})
 OUTCOMES = frozenset({"reachable", "unreachable", "inconclusive"})
 RESULT_REQUIRED_FIELDS = frozenset(
     {"vpn_id", "target_revision", "icmp_ok", "protocol_ok", "protocol_probe", "checked_at"}
@@ -399,7 +399,7 @@ def _resolve_global_addresses(
     except socket.gaierror:
         raise _ResolutionProblem("dns_failed") from None
     except OSError:
-        raise _ResolutionProblem("dns_failure") from None
+        raise _ResolutionProblem("dns_failed") from None
     except Exception:
         raise _ResolutionProblem("dns_failure") from None
 
@@ -840,7 +840,7 @@ def _run_ike(runner: Any, argv: list[str], timeout_seconds: float) -> tuple[int,
         shell=False,
         timeout=timeout_seconds,
         capture_output=True,
-        text=True,
+        text=False,
         check=False,
     )
     return _runner_fields(completed)
@@ -1159,7 +1159,7 @@ def probe_icmp(
                 ["ping", "-n", "-c", "1", "-W", "1", address],
                 shell=False,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=min(1.0, float(active_limits.timeout_seconds)),
                 check=False,
             )
@@ -1223,9 +1223,14 @@ def probe_target(
     try:
         normalized = validate_target(target)
         active_limits = limits or ProbeLimits()
-        probe_type = {"tcp_connect": "tcp", "ike": "ike", "openvpn_udp": "openvpn_udp"}.get(
-            _probe_type_for(normalized) or "", probe_type
-        )
+        raw_probe_type = _probe_type_for(normalized)
+        if raw_probe_type is None:
+            return _cycle_result(
+                normalized, icmp_ok=False, icmp_code="unsupported_probe", protocol_ok=False,
+                protocol_code="unsupported_probe", protocol_probe=probe_type,
+                latency_ms=None, clock=clock,
+            )
+        probe_type = {"tcp_connect": "tcp", "ike": "ike", "openvpn_udp": "openvpn_udp"}[raw_probe_type]
         addresses = _resolve_global_addresses(
             normalized["host"], normalized["port"], resolver=resolver,
             timeout_seconds=float(active_limits.timeout_seconds),
@@ -1649,10 +1654,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=DEFAULT_PROBE_TIMEOUT_SECONDS)
     parser.add_argument("--target-ids", default=os.environ.get(TARGET_IDS_ENV))
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args(argv)
     try:
         target_ids = parse_target_selector(args.target_ids)
-        client = PanelClient(args.panel_url, load_monitor_token(args.token_file))
+        token = load_monitor_token(args.token_file)
+        if args.healthcheck:
+            return 0
+        client = PanelClient(args.panel_url, token)
         run_worker(
             client,
             once=args.once,
