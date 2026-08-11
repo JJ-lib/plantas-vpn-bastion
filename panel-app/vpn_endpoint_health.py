@@ -445,17 +445,19 @@ def apply_probe_result(
     """Apply one result in one transaction and emit only state transitions."""
     normalized = validate_result(result)
     expected = _revision(expected_revision)
+    if normalized["target_revision"] != expected:
+        raise StaleRevisionError("The result revision does not match the current target revision.")
     generation = normalized["target_generation"] if expected_generation is None else _strict_int(expected_generation, "expected_generation", 0, MAX_TARGET_GENERATION)
     if normalized["target_generation"] != generation:
         raise StaleRevisionError("The endpoint target generation changed before this result arrived.")
 
     with _write_transaction(conn, "endpoint_health_apply"):
         previous = _health_row(conn, normalized["vpn_id"])
-        if previous and previous["target_revision"] != expected:
-            raise StaleRevisionError("The endpoint target changed before this result arrived.")
         if previous and normalized["target_generation"] < int(previous["target_generation"]):
             raise StaleRevisionError("The endpoint target generation is older than stored state.")
-        if previous and normalized["target_generation"] == int(previous["target_generation"]):
+        revision_changed = bool(previous and previous["target_revision"] != expected)
+        generation_changed = normalized["target_generation"] != (int(previous["target_generation"]) if previous else -1)
+        if previous and not revision_changed and normalized["target_generation"] == int(previous["target_generation"]):
             previous_cycle = int(previous["cycle_id"])
             if normalized["cycle_id"] and normalized["cycle_id"] < previous_cycle:
                 raise StaleCycleError("The endpoint cycle is older than stored state.")
@@ -482,7 +484,7 @@ def apply_probe_result(
         last_transition = checked_at if transitioned else (previous["last_transition_at"] if previous else None)
         cycle_id = normalized["cycle_id"] or (int(previous["cycle_id"]) + 1 if previous else 1)
         lease_id = normalized["lease_id"] or (str(previous["lease_id"]) if previous else "legacy")
-        if normalized["target_generation"] != (int(previous["target_generation"]) if previous else -1):
+        if revision_changed or generation_changed:
             failures = 0
             last_success = None
             old_state = "accessible"
@@ -658,7 +660,7 @@ def history_intervals(
             "protocol_code": event["protocol_code"],
         }
         cursor = max(cursor, at)
-    if cursor < checked_now or (events and cursor == checked_now and state != str(events[-1]["old_state"])):
+    if cursor < checked_now:
         intervals.append({"start_at": cursor, "end_at": checked_now, "state": state, **evidence})
     return intervals
 

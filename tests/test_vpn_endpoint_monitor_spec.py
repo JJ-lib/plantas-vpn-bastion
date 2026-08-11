@@ -116,7 +116,7 @@ class FinalHealthContractTests(unittest.TestCase):
                 self.result(icmp_ok=checked_at == 1000, checked_at=checked_at),
                 expected_revision=self.revision,
             )
-        intervals = history_intervals(self.conn, 1, now=1180, history_hours=5)
+        intervals = history_intervals(self.conn, 1, now=1300, history_hours=5)
         self.assertTrue(intervals)
         self.assertEqual({item["state"] for item in intervals}, {"accessible", "unreachable"})
 

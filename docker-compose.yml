@@ -66,7 +66,7 @@ services:
     depends_on:
       - panel
     healthcheck:
-      test: ["CMD", "python", "-m", "vpn_endpoint_monitor", "--once"]
+      test: ["CMD", "python", "-m", "vpn_endpoint_monitor", "--healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3

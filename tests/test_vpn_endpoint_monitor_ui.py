@@ -123,7 +123,7 @@ class EndpointMonitorUiTests(unittest.TestCase):
             ).fetchone()
             return self.mod._monitor_target_from_row(row)
 
-    def apply_result(self, outcome, code, latency=42, count=1):
+    def apply_result(self, *, icmp_ok=False, protocol_ok=False, protocol_code='ike_no_response', latency=42, count=1):
         base = self.target()
         now = int(self.mod.time.time())
         with self.mod.app.app_context():
@@ -136,64 +136,82 @@ class EndpointMonitorUiTests(unittest.TestCase):
                     "target_generation": target["target_generation"],
                     "cycle_id": target["cycle_id"],
                     "lease_id": target["lease_id"],
-                    "probe_type": "ike",
-                    "outcome": outcome,
-                    "public_code": code,
+                    "icmp_ok": icmp_ok,
+                    "protocol_ok": protocol_ok,
+                    "protocol_probe": "ike",
+                    "icmp_code": "icmp_reply" if icmp_ok else "icmp_timeout",
+                    "protocol_code": protocol_code,
                     "latency_ms": latency,
-                    "observed_at": now,
+                    "checked_at": now,
                 }
                 self.mod.apply_probe_result(
                     self.mod.db(), result, expected_revision=target["target_revision"]
                 )
 
     def test_two_failures_show_user_alert_without_gateway_details(self):
-        self.apply_result("unreachable", "ike_unreachable", count=2)
+        self.apply_result(protocol_code="ike_unreachable", count=3)
         self.login_as(self.viewer_id)
         response = self.client.get("/")
         body = response.get_data(as_text=True)
         self.assertEqual(response.status_code, 200)
-        self.assertIn("El servidor público de la VPN no responde", body)
+        self.assertIn("Servidor VPN inaccesible", body)
         self.assertIn("role='status'", body)
         self.assertNotIn("vpn.example.test", body)
         self.assertNotIn("vpn.example.test:500", body)
         self.assertNotIn("ike_no_response", body)
 
     def test_first_failure_does_not_show_user_alert(self):
-        self.apply_result("unreachable", "ike_unreachable")
+        self.apply_result(protocol_code="ike_unreachable")
         self.login_as(self.viewer_id)
         body = self.client.get("/").get_data(as_text=True)
-        self.assertNotIn("El servidor público de la VPN no responde", body)
+        self.assertNotIn("Servidor VPN inaccesible", body)
 
     def test_online_tunnel_suppresses_alert_but_admin_sees_discrepancy(self):
-        self.apply_result("unreachable", "ike_unreachable", count=2)
+        self.apply_result(protocol_code="ike_unreachable", count=3)
         self.mod.vpn_runtime = lambda _vpn: (True, "198.51.100.20", "")
         self.login_as(1)
         body = self.client.get("/").get_data(as_text=True)
-        self.assertNotIn("El servidor público de la VPN no responde", body)
+        self.assertNotIn("Servidor VPN inaccesible", body)
         self.assertIn("La sonda pública no responde, pero el túnel está activo", body)
 
     def test_success_clears_the_user_alert(self):
-        self.apply_result("unreachable", "ike_unreachable", count=2)
-        self.apply_result("reachable", "ike_response")
+        self.apply_result(protocol_code="ike_unreachable", count=3)
+        self.apply_result(protocol_ok=True, protocol_code="ike_response")
         self.login_as(self.viewer_id)
         body = self.client.get("/").get_data(as_text=True)
-        self.assertNotIn("El servidor público de la VPN no responde", body)
+        self.assertNotIn("Servidor VPN inaccesible", body)
 
     def test_admin_table_exposes_only_normalized_diagnostic_fields(self):
-        self.apply_result("unreachable", "ike_unreachable", latency=None, count=2)
+        self.apply_result(protocol_code="ike_unreachable", latency=None, count=3)
         self.login_as(1)
         response = self.client.get("/admin/vpns")
         body = response.get_data(as_text=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn("Endpoint público", body)
-        self.assertIn("data-endpoint-state='down'", body)
-        self.assertIn("Puerto UDP no accesible", body)
+        self.assertIn("data-endpoint-state='unreachable'", body)
+        self.assertIn("IKE: Fallo", body)
         self.assertIn("endpoint-health-meta", body)
         self.assertIn("<dt>Fallos consecutivos</dt>", body)
         self.assertNotIn("Fallos: 2 · Última:", body)
         self.assertIn("vpn.example.test:500", body)
         self.assertNotIn("sealed-password", body)
         self.assertNotIn("synthetic tunnel offline", body)
+
+    def test_offline_accessible_endpoint_does_not_show_user_alert(self):
+        self.apply_result(icmp_ok=True, protocol_code="ike_no_response")
+        self.login_as(self.viewer_id)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn("Servidor VPN inaccesible", body)
+
+    def test_history_is_only_rendered_on_admin_vpn_detail(self):
+        self.apply_result(protocol_code="ike_unreachable", count=3)
+        self.apply_result(protocol_ok=True, protocol_code="ike_response")
+        self.login_as(1)
+        listing = self.client.get("/admin/vpns").get_data(as_text=True)
+        detail = self.client.get(f"/admin/vpns/{self.vpn_id}/edit").get_data(as_text=True)
+        self.assertNotIn("endpoint-history", listing)
+        self.assertIn("endpoint-history", detail)
+        self.assertIn("Histórico de accesibilidad de las últimas 5 horas", detail)
 
     def test_unauthorized_user_cannot_view_admin_diagnostics(self):
         self.login_as(self.viewer_id)
