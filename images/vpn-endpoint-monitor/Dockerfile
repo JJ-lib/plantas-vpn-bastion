@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
        ca-certificates \
+       iputils-ping \
        ike-scan=1.9.5-2 \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system --gid 65532 monitor \
