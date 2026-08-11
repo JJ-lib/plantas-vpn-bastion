@@ -20,11 +20,13 @@ jobs:
           cache: pip
           cache-dependency-path: panel-app/requirements.txt
       - name: Install application dependencies
-        run: python -m pip install --disable-pip-version-check -r panel-app/requirements.txt
+        run: python -m pip install --disable-pip-version-check -r panel-app/requirements.txt PyYAML==6.0.2
       - name: Compile Python sources
         run: python -m compileall -q panel-app tests
       - name: Run project test runner
         run: python tests/run_full_suite.py
+      - name: Prepare synthetic monitor secret
+        run: printf '%s\n' synthetic-ci-only > /tmp/vpn-endpoint-monitor-token
       - name: Validate root Compose
         env:
           GUAC_JSON_KEY: synthetic-ci-only
@@ -36,6 +38,10 @@ jobs:
           RECONCILER_IMAGE: example.invalid/bastion-reconciler@sha256:1111111111111111111111111111111111111111111111111111111111111111
           GUACD_IMAGE: example.invalid/bastion-guacd@sha256:2222222222222222222222222222222222222222222222222222222222222222
           GUACAMOLE_IMAGE: example.invalid/bastion-guacamole@sha256:3333333333333333333333333333333333333333333333333333333333333333
+          MONITOR_IMAGE: example.invalid/bastion-vpn-endpoint-monitor@sha256:4444444444444444444444444444444444444444444444444444444444444444
+          CADDY_IMAGE: example.invalid/caddy@sha256:5555555555555555555555555555555555555555555555555555555555555555
+          VPN_ENDPOINT_MONITOR_TOKEN_FILE: /tmp/vpn-endpoint-monitor-token
+          VPN_ENDPOINT_MONITOR_TARGET_IDS: ""
         run: docker compose -f docker-compose.yml config --quiet
       - name: Check clipboard contract
         run: python guacamole-server/test_clipboard_file_transfer_contract.py

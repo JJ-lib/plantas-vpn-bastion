@@ -20,6 +20,11 @@ The tracked `.env.example` documents names only:
 - `VALIDATION_DENY_CIDRS` — deployment validation policy supplied outside Git.
 - `PANEL_IMAGE`, `RECONCILER_IMAGE`, `GUACD_IMAGE`, and `GUACAMOLE_IMAGE` — immutable image references supplied by promotion.
 - `GUAC_JSON_KEY` — shared JSON authentication/signing secret for Guacamole.
+- `VPN_ENDPOINT_MONITOR_TOKEN_FILE` — external bearer-token file shared read-only by the panel and monitor.
+- `VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED` — fail-closed switch for target collection/result ingestion; default `false`.
+- `VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED` — fail-closed switch for endpoint details on administrator VPN pages; default `false`.
+- `VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED` — ordinary-user card alerts; default `false` and independent of the two monitor gates.
+- `VPN_ENDPOINT_MONITOR_TARGET_IDS` — comma-separated numeric VPN IDs for a canary allowlist. An explicit empty value selects no targets; an unset selector is the distinct all-target production mode.
 
 Use a secret manager or a protected root-owned `.env` file with mode `0600`. Never print values during diagnostics.
 
@@ -32,6 +37,12 @@ Use a secret manager or a protected root-owned `.env` file with mode `0600`. Nev
 - `caddy` — ingress and static portal service.
 
 The root Compose file also defines the shared `bastion_net` network and persistent Caddy/panel volumes.
+
+## Endpoint-monitor promotion gates
+
+Keep collection, administrator diagnostics, and ordinary-user alerts disabled while promoting the monitor. Enable collection only after the worker image and token contract are verified. Start a canary with `VPN_ENDPOINT_MONITOR_TARGET_IDS` containing only approved existing VPN IDs; the worker filters the panel's real target snapshot and never creates a synthetic VPN row. An empty selector is fail-closed and probes nothing. Do not use an all-target run until promotion is explicitly approved.
+
+Ordinary users receive only the generic alert text when the public-alert flag is enabled and the health policy confirms two failures while the tunnel is offline. They never receive gateway hostnames, addresses, ports, latency, probe codes, commands, or raw diagnostics. Administrator endpoint details remain unavailable unless the separate diagnostics flag is enabled.
 
 ## Generated site overlays
 

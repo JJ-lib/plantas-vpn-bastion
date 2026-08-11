@@ -12,13 +12,57 @@ services:
       GUAC_JSON_KEY: ${GUAC_JSON_KEY:?Set GUAC_JSON_KEY outside Git}
       BASTION_PUBLIC_ORIGIN: ${BASTION_PUBLIC_ORIGIN:-http://127.0.0.1}
       VALIDATION_DENY_CIDRS: ${VALIDATION_DENY_CIDRS:?Set VALIDATION_DENY_CIDRS outside Git}
+      VPN_ENDPOINT_MONITOR_TOKEN_FILE: /run/secrets/monitor-token
+      VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED: ${VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED:-false}
+      VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED: ${VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED:-false}
+      VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED: ${VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED:-false}
     volumes:
       - panel_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/libexec/docker/cli-plugins/docker-compose:/usr/libexec/docker/cli-plugins/docker-compose:ro
       - ${BASTION_PROJECT_ROOT:?Set BASTION_PROJECT_ROOT outside Git}:/opt/bastion-vpn
+    secrets:
+      - source: monitor_token
+        target: monitor-token
+        uid: "0"
+        gid: "0"
+        mode: "0440"
     networks:
       - bastion
+
+  vpn-endpoint-monitor:
+    image: ${MONITOR_IMAGE:?Set MONITOR_IMAGE to an immutable image reference}
+    container_name: bastion-vpn-endpoint-monitor
+    labels:
+      com.plantas-vpn-bastion.egress-policy: deny-private-linklocal-cgnat-reserved
+      com.plantas-vpn-bastion.egress-policy-required: "true"
+    restart: unless-stopped
+    command: ["python", "-m", "vpn_endpoint_monitor", "--interval", "300"]
+    environment:
+      PANEL_INTERNAL_URL: http://panel:5000
+      VPN_ENDPOINT_MONITOR_TOKEN_FILE: /run/secrets/monitor-token
+      VPN_ENDPOINT_MONITOR_TARGET_IDS: ${VPN_ENDPOINT_MONITOR_TARGET_IDS}
+      # Contract only: host firewall/egress proxy must enforce this policy.
+      # Docker bridge networking alone does not enforce destination policy.
+      VPN_ENDPOINT_MONITOR_EGRESS_POLICY: external-global-unicast-only
+    secrets:
+      - source: monitor_token
+        target: monitor-token
+        uid: "65532"
+        gid: "65532"
+        mode: "0440"
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    networks:
+      - bastion
+    depends_on:
+      - panel
 
   vpn-reconciler:
     image: ${RECONCILER_IMAGE:?Set RECONCILER_IMAGE to an immutable image reference}
@@ -62,7 +106,7 @@ services:
       - guacd
 
   caddy:
-    image: caddy:2-alpine
+    image: ${CADDY_IMAGE:?Set CADDY_IMAGE to an immutable image reference}
     container_name: bastion-caddy
     restart: unless-stopped
     ports:
@@ -82,8 +126,14 @@ services:
 networks:
   bastion:
     name: bastion_net
+    labels:
+      com.plantas-vpn-bastion.monitor-egress-policy: deny-private-linklocal-cgnat-reserved
 
 volumes:
   caddy_data:
   caddy_config:
   panel_data:
+
+secrets:
+  monitor_token:
+    file: ${VPN_ENDPOINT_MONITOR_TOKEN_FILE:?Set VPN_ENDPOINT_MONITOR_TOKEN_FILE outside Git}

@@ -1,13 +1,14 @@
 import threading
 import fcntl,functools
 
-import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json
+import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json, hmac, stat
 from urllib.parse import quote
 from datetime import datetime
 from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messages,Response,has_request_context,jsonify
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
+from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, public_alert_eligible, configure_sqlite_connection, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
@@ -136,8 +137,12 @@ def enc(x): return F.encrypt((x or '').encode()).decode()
 def dec(x):
     try: return F.decrypt((x or '').encode()).decode() if x else ''
     except Exception: return ''
+def _connect_db():
+    conn=configure_sqlite_connection(sqlite3.connect(DB, timeout=5.0))
+    conn.row_factory=sqlite3.Row
+    return conn
 def db():
-    if 'db' not in g: g.db=sqlite3.connect(DB); g.db.row_factory=sqlite3.Row
+    if 'db' not in g: g.db=_connect_db()
     return g.db
 _vpn_lock_local=threading.local()
 class vpn_slug_lock:
@@ -279,8 +284,18 @@ def ensure_bootstrap_admin(conn,now):
     if len(password)<16 or any(ord(ch)<32 or ord(ch)==127 for ch in password):
         raise RuntimeError('PANEL_BOOTSTRAP_ADMIN_PASSWORD es obligatorio y debe tener al menos 16 caracteres para una base nueva.')
     conn.execute('INSERT INTO users(id,username,password_hash,role,active,created_at) VALUES(1,?,?,?,?,?)',('admin',generate_password_hash(password),'admin',1,now))
+
+def ensure_monitor_lease_schema(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS vpn_endpoint_monitor_leases(
+        vpn_id INTEGER PRIMARY KEY,
+        target_generation INTEGER NOT NULL,
+        cycle_id INTEGER NOT NULL,
+        lease_id TEXT NOT NULL,
+        issued_at INTEGER NOT NULL
+    )""")
+
 def init():
-    c=sqlite3.connect(DB); now=datetime.now().isoformat(timespec='seconds')
+    c=_connect_db(); now=datetime.now().isoformat(timespec='seconds')
     for q in [
     'CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT, role TEXT, active INTEGER, created_at TEXT)',
     'CREATE TABLE IF NOT EXISTS equipment(id INTEGER PRIMARY KEY, plant TEXT, name TEXT, kind TEXT, real_ip TEXT, real_port TEXT, path TEXT, public_url TEXT, description TEXT, active INTEGER, created_at TEXT, vpn_id INTEGER)',
@@ -315,6 +330,8 @@ def init():
     migrate_vpn_access_columns(c)
     ensure_openvpn_import_staging(c)
     ensure_onboarding_schema(c)
+    ensure_endpoint_health_schema(c)
+    ensure_monitor_lease_schema(c)
     c.execute("UPDATE vpns SET ipsec_engine='libreswan' WHERE ipsec_engine IS NULL OR trim(ipsec_engine)=''")
     c.execute("UPDATE vpns SET ipsec_engine='strongswan' WHERE ike_version='ikev2'")
     c.execute("UPDATE vpns SET dh_groups=dh_group WHERE dh_groups IS NULL OR trim(dh_groups)=''")
@@ -363,11 +380,241 @@ def admin(f):
         if u['role']!='admin': abort(403)
         return f(*a,**kw)
     return w
+
+ENDPOINT_PUBLIC_ALERTS_ENV='VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED'
+ENDPOINT_MONITOR_COLLECTION_ENV='VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED'
+ENDPOINT_ADMIN_DIAGNOSTICS_ENV='VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED'
+def _feature_enabled(name):
+    return os.environ.get(name,'false').strip().lower() in {'1','true','yes','on'}
+def endpoint_public_alerts_enabled():
+    return _feature_enabled(ENDPOINT_PUBLIC_ALERTS_ENV)
+def endpoint_monitor_collection_enabled():
+    return _feature_enabled(ENDPOINT_MONITOR_COLLECTION_ENV)
+def endpoint_admin_diagnostics_enabled():
+    return _feature_enabled(ENDPOINT_ADMIN_DIAGNOSTICS_ENV)
+
+ENDPOINT_STATE_LABELS={'healthy':'Saludable','suspect':'Primer fallo pendiente de confirmar','down':'Sin respuesta','unknown':'No concluyente','stale':'Comprobación obsoleta','disabled':'Monitorización desactivada'}
+ENDPOINT_CODE_LABELS={'tcp_accept':'Puerto TCP abierto','tcp_unreachable':'Puerto TCP no accesible','ike_response':'Respuesta IKE recibida','udp_response':'Puerto UDP responde','ike_no_response':'Puerto UDP sin respuesta (no concluyente)','ike_unreachable':'Puerto UDP no accesible','openvpn_udp_response':'Puerto UDP responde','udp_port_unreachable':'Puerto UDP cerrado','udp_silent':'Puerto UDP sin respuesta (no concluyente)','dns_failed':'No se pudo resolver la dirección pública','dns_failure':'No se pudo resolver la dirección pública','dns_timeout':'Tiempo de resolución agotado','dns_no_answers':'DNS sin respuestas','dns_no_global_address':'La dirección pública no es válida','private_or_reserved_destination':'Destino no público','probe_error':'No se pudo comprobar el puerto','unsupported_probe':'Tipo de VPN no compatible','not_checked':'Sin datos'}
+
+def endpoint_health_map(vpns):
+    ids=[int(v['id']) for v in vpns if v is not None]
+    return health_for_vpns(db(),ids) if ids else {}
+
+def endpoint_card_alert(health,online,admin_view=False):
+    if not health:return ''
+    if online:
+        if not endpoint_admin_diagnostics_enabled():return ''
+        return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>" if admin_view and health.get('state')=='down' else ''
+    if not public_alert_eligible(health):return ''
+    if not endpoint_public_alerts_enabled():return ''
+    return "<div class='endpoint-alert' role='status' aria-live='polite'><strong>El servidor público de la VPN no responde</strong><span>Se han confirmado dos fallos consecutivos.</span></div>"
+
+def endpoint_health_admin_markup(health):
+    if not endpoint_admin_diagnostics_enabled():return ''
+    health=health or {'state':'unknown','consecutive_failures':0,'public_code':'not_checked','last_checked_at':None,'last_success_at':None,'latency_ms':None}
+    state=str(health.get('state') or 'unknown')
+    code_key=str(health.get('public_code') or 'not_checked')
+    label='Sin datos' if code_key=='not_checked' else ENDPOINT_STATE_LABELS.get(state,ENDPOINT_STATE_LABELS['unknown'])
+    code=ENDPOINT_CODE_LABELS.get(code_key,ENDPOINT_CODE_LABELS['probe_error'])
+    def local_time(value):
+        if value is None:return 'Sin datos'
+        try:return datetime.fromtimestamp(int(value)).strftime('%Y-%m-%d %H:%M:%S')
+        except (TypeError,ValueError,OSError,OverflowError):return 'Sin datos'
+    failures=max(0,int(health.get('consecutive_failures') or 0))
+    latency='Sin datos' if health.get('latency_ms') is None else f"{int(health['latency_ms'])} ms"
+    metrics=(
+        ('Fallos consecutivos',str(failures)),
+        ('Última comprobación',local_time(health.get('last_checked_at'))),
+        ('Último éxito',local_time(health.get('last_success_at'))),
+        ('Latencia',latency),
+    )
+    meta=''.join(f"<div><dt>{html.escape(name)}</dt><dd>{html.escape(value)}</dd></div>" for name,value in metrics)
+    return (f"<div class='endpoint-health' data-endpoint-state='{html.escape(state,quote=True)}'>"
+            f"<div class='endpoint-health-title'><strong>{html.escape(label)}</strong><span class='endpoint-health-code'>{html.escape(code)}</span></div>"
+            f"<dl class='endpoint-health-meta'>{meta}</dl></div>")
+
+MONITOR_TOKEN_FILE_ENV='VPN_ENDPOINT_MONITOR_TOKEN_FILE'
+MONITOR_DEFAULT_TOKEN_FILE='/run/secrets/vpn_endpoint_monitor_token'
+MONITOR_TOKEN_MIN_BYTES=32
+MONITOR_TOKEN_MAX_BYTES=256
+MONITOR_MAX_BODY_BYTES=64*1024
+MONITOR_MAX_BATCH=500
+
+def _monitor_token_bytes():
+    path=os.environ.get(MONITOR_TOKEN_FILE_ENV,'').strip() or MONITOR_DEFAULT_TOKEN_FILE
+    if len(path)>4096 or '\0' in path:return None
+    try:
+        info=os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size>MONITOR_TOKEN_MAX_BYTES:return None
+        if os.name!='nt' and info.st_mode & 0o022:return None
+        with open(path,'rb') as fh:raw=fh.read(MONITOR_TOKEN_MAX_BYTES+1)
+    except (OSError,ValueError):return None
+    raw=raw.rstrip(bytes((13,10)))
+    if not MONITOR_TOKEN_MIN_BYTES<=len(raw)<=MONITOR_TOKEN_MAX_BYTES:return None
+    if any(byte<33 or byte>126 for byte in raw):return None
+    return raw
+
+def _monitor_authorized():
+    header=request.headers.get('Authorization','')
+    if not isinstance(header,str) or not header.startswith('Bearer '):return False
+    try:provided=header[7:].encode('ascii')
+    except UnicodeEncodeError:return False
+    expected=_monitor_token_bytes()
+    return expected is not None and hmac.compare_digest(provided,expected)
+
+def monitor_internal(f):
+    @functools.wraps(f)
+    def wrapped(*args,**kwargs):
+        if not endpoint_monitor_collection_enabled() or not _monitor_authorized():abort(404)
+        return f(*args,**kwargs)
+    return wrapped
+
+def _row_value(row,name,default=None):
+    try:return row[name]
+    except (IndexError,KeyError):return default
+
+def _monitor_openvpn_transport(row):
+    profile=_row_value(row,'openvpn_profile_enc','')
+    if profile:
+        decoded=dec(profile)
+        for raw_line in decoded.splitlines():
+            parts=raw_line.strip().split()
+            if len(parts)>=2 and parts[0].lower()=='proto':
+                proto=parts[1].lower()
+                if proto.startswith('tcp'):return 'tcp'
+                if proto.startswith('udp'):return 'udp'
+    return 'udp'
+
+def _monitor_target_from_row(row, *, cycle_id=0, lease_id='pending'):
+    target_generation=int(_row_value(row,'onboarding_revision',0) or 0)
+    vpn_type=str(_row_value(row,'vpn_type','ssl') or 'ssl').strip().lower()
+    if vpn_type not in VPN_TYPES:raise ValueError('unsupported_vpn_type')
+    host=str(_row_value(row,'host','') or '').strip().lower().rstrip('.')
+    if not 1<=len(host)<=253 or any(ord(ch)<33 or ord(ch)==127 for ch in host):raise ValueError('invalid_host')
+    port_value=_row_value(row,'port','')
+    if isinstance(port_value,bool):raise ValueError('invalid_port')
+    try:port=int(str(port_value).strip(),10)
+    except (TypeError,ValueError):raise ValueError('invalid_port')
+    if not 1<=port<=65535:raise ValueError('invalid_port')
+    transport='tcp' if vpn_type in {'ssl','pptp'} else ('udp' if vpn_type=='ipsec' else _monitor_openvpn_transport(row))
+    config={'vpn_type':vpn_type,'host':host,'port':port,'transport':transport}
+    target={'vpn_id':int(row['id']),'target_revision':'','target_generation':target_generation,'cycle_id':int(cycle_id),'lease_id':lease_id,'vpn_type':vpn_type,'host':host,'port':port,'transport':transport,'ike_version':'','aggressive':False,'nat_t':False}
+    if vpn_type=='ipsec':
+        ike=str(_row_value(row,'ike_version','ikev1') or 'ikev1').strip().lower()
+        if ike not in {'ikev1','ikev2'}:raise ValueError('invalid_ike_version')
+        aggressive=bool(int(_row_value(row,'aggressive',0) or 0))
+        nat_t=bool(int(_row_value(row,'nat_traversal',0) or 0))
+        allowed_ports = {500, 4500} if nat_t else {500}
+        if port not in allowed_ports:raise ValueError('invalid_ipsec_port')
+        config.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
+        target.update(ike_version=ike,aggressive=aggressive,nat_t=nat_t)
+    target['target_revision']=target_revision(config)
+    return target
+
+def _monitor_expected_probe(target):
+    if target['vpn_type']=='ipsec':return 'ike'
+    return 'tcp_connect' if target['transport']=='tcp' else 'openvpn_udp'
+
+def _monitor_json(raw):
+    def pairs(items):
+        result={}
+        for key,value in items:
+            if key in result:raise ValueError('duplicate_json_key')
+            result[key]=value
+        return result
+    return json.loads(raw.decode('utf-8'),object_pairs_hook=pairs,parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+
+@app.route('/internal/vpn-endpoint-monitor/targets',methods=['GET'])
+@monitor_internal
+def monitor_targets():
+    conn=db(); now=int(time.time()); targets=[]
+    try:
+        after_id=max(0,int(request.args.get('after_id','0')))
+        requested_limit=max(1,min(MONITOR_MAX_BATCH,int(request.args.get('limit',MONITOR_MAX_BATCH))))
+    except (TypeError,ValueError):
+        return jsonify(targets=[]),400
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        rows=conn.execute('SELECT * FROM vpns WHERE active=1 AND id>? ORDER BY id LIMIT ?', (after_id,requested_limit)).fetchall()
+        for row in rows:
+            try:
+                generation=int(_row_value(row,'onboarding_revision',0) or 0)
+                prior=conn.execute('SELECT target_generation,cycle_id FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(int(row['id']),)).fetchone()
+                cycle=(int(prior['cycle_id'])+1 if prior and int(prior['target_generation'])==generation else 1)
+                lease=secrets.token_urlsafe(32)
+                target=_monitor_target_from_row(row,cycle_id=cycle,lease_id=lease)
+                conn.execute('INSERT INTO vpn_endpoint_monitor_leases(vpn_id,target_generation,cycle_id,lease_id,issued_at) VALUES(?,?,?,?,?) ON CONFLICT(vpn_id) DO UPDATE SET target_generation=excluded.target_generation,cycle_id=excluded.cycle_id,lease_id=excluded.lease_id,issued_at=excluded.issued_at',(int(row['id']),generation,cycle,lease,now))
+                targets.append(target)
+            except (TypeError,ValueError,OverflowError):
+                conn.rollback()
+                return jsonify(targets=[]), 503
+        conn.commit()
+    except sqlite3.DatabaseError:
+        conn.rollback(); return jsonify(targets=[]),503
+    payload={'targets':targets}
+    if len(rows)==requested_limit and rows:
+        payload['next_after_id']=int(rows[-1]['id'])
+    return jsonify(payload)
+
+@app.route('/internal/vpn-endpoint-monitor/results',methods=['POST'])
+@monitor_internal
+def monitor_results():
+    if request.content_length is not None and request.content_length>MONITOR_MAX_BODY_BYTES:
+        return jsonify(ok=False,code='request_too_large'),413
+    raw=request.get_data(cache=False)
+    if len(raw)>MONITOR_MAX_BODY_BYTES:return jsonify(ok=False,code='request_too_large'),413
+    try:payload=_monitor_json(raw)
+    except (UnicodeDecodeError,TypeError,ValueError,json.JSONDecodeError):return jsonify(ok=False,code='invalid_request'),400
+    if not isinstance(payload,dict) or set(payload)!={'results'} or not isinstance(payload['results'],list) or len(payload['results'])>MONITOR_MAX_BATCH:
+        return jsonify(ok=False,code='invalid_request'),400
+    normalized=[];seen=set()
+    for item in payload['results']:
+        try:row=validate_result(item)
+        except (TypeError,ValueError):return jsonify(ok=False,code='invalid_result'),400
+        if row['vpn_id'] in seen:return jsonify(ok=False,code='duplicate_vpn_id'),400
+        seen.add(row['vpn_id']);normalized.append(row)
+    conn=db()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        placeholders=','.join('?' for _ in normalized)
+        rows=conn.execute(f'SELECT * FROM vpns WHERE active=1 AND id IN ({placeholders})',tuple(seen)).fetchall()
+        by_id={int(row['id']):row for row in rows}
+        if len(by_id)!=len(normalized):
+            conn.rollback();return jsonify(ok=False,code='target_unavailable'),409
+        targets={}
+        for row in normalized:
+            vpn=by_id[row['vpn_id']]
+            lease=conn.execute('SELECT * FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(row['vpn_id'],)).fetchone()
+            generation=int(_row_value(vpn,'onboarding_revision',0) or 0)
+            if lease is None or row['target_generation']!=generation:
+                conn.rollback();return jsonify(ok=False,code='stale_target_generation'),409
+            if row['target_generation']!=int(lease['target_generation']) or row['cycle_id']!=int(lease['cycle_id']) or row['lease_id']!=lease['lease_id']:
+                conn.rollback();return jsonify(ok=False,code='invalid_monitor_lease'),409
+            try:target=_monitor_target_from_row(vpn,cycle_id=row['cycle_id'],lease_id=row['lease_id'])
+            except (TypeError,ValueError,OverflowError):
+                conn.rollback();return jsonify(ok=False,code='target_unavailable'),409
+            targets[row['vpn_id']]=target
+            if row['target_revision']!=target['target_revision']:
+                conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
+            if row['probe_type']!=_monitor_expected_probe(target):
+                conn.rollback();return jsonify(ok=False,code='probe_type_mismatch'),400
+        for row in normalized:apply_probe_result(conn,row,expected_revision=targets[row['vpn_id']]['target_revision'],expected_generation=targets[row['vpn_id']]['target_generation'])
+        conn.commit()
+    except StaleRevisionError:
+        conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
+    except StaleCycleError:
+        conn.rollback();return jsonify(ok=False,code='stale_cycle'),409
+    except ValueError:
+        conn.rollback();return jsonify(ok=False,code='invalid_monitor_lease'),409
+    except sqlite3.DatabaseError:
+        conn.rollback();return jsonify(ok=False,code='storage_unavailable'),503
+    return jsonify(ok=True,accepted=len(normalized),rejected=0)
+
 S=r"""
 :root{--canvas:#f5f5f5;--paper:#fff;--surface:#fafafa;--ink:#0a0a0a;--ink-soft:#171717;--muted:#737373;--hairline:#e5e5e5;--success:#16a34a;--danger:#e7000b;--card-radius:24px;--control-radius:18px;--shadow:0 0 0 1px rgba(23,23,23,.05),0 1px 3px rgba(0,0,0,.10),0 1px 2px -1px rgba(0,0,0,.10)}
 [data-theme='dark']{--canvas:#0a0a0a;--paper:#171717;--surface:#111;--ink:#fafafa;--ink-soft:#e5e5e5;--muted:#a3a3a3;--hairline:#2f2f2f;--success:#4ade80;--danger:#ff4d55;--shadow:0 0 0 1px rgba(255,255,255,.08),0 1px 3px rgba(0,0,0,.45),0 1px 2px -1px rgba(0,0,0,.5)}
-*{box-sizing:border-box}[hidden]{display:none!important}html{background:var(--canvas);color-scheme:light}html[data-theme='dark']{color-scheme:dark}body{font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--canvas);color:var(--ink);margin:0;font-size:14px;line-height:1.43;font-feature-settings:"ss01" 1,"cv11" 1;transition:background .18s ease,color .18s ease}a{color:inherit}.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--surface) 92%,transparent);border-bottom:1px solid var(--hairline);backdrop-filter:blur(14px)}.topbar-inner{max-width:1280px;margin:auto;min-height:64px;padding:10px 24px;display:flex;align-items:center;gap:18px}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:600;letter-spacing:-.025em}.brand-mark{width:28px;height:28px;border-radius:9px;background:var(--ink);color:var(--paper);display:grid;place-items:center;font-size:11px}.nav{margin-left:auto;display:flex;align-items:center;gap:6px}.user-chip{color:var(--muted);padding:8px 10px}.wrap{max-width:1280px;margin:auto;padding:44px 24px 64px}.page-head{margin:0 0 28px}.eyebrow{margin:0 0 8px;color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.page-head h1{font-size:36px;line-height:1.11;letter-spacing:-.025em;margin:0;font-weight:600}.page-head p{max-width:680px;color:var(--muted);font-size:16px}.card{display:block;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:20px;margin:10px 0;color:var(--ink)}a.card{text-decoration:none;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}a.card:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--ink) 22%,var(--hairline))}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.plant-grid{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}.plant-card{min-height:210px;display:flex!important;flex-direction:column;justify-content:space-between}.plant-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.plant-card h2{font-size:24px;line-height:1.33;letter-spacing:-.025em;margin:0}.plant-count{font-size:36px;line-height:1.11;letter-spacing:-.025em;font-weight:600;margin:22px 0 2px}.plant-meta{color:var(--muted);margin:0}.plant-footer{display:flex;align-items:center;justify-content:space-between;margin-top:22px}.status{display:inline-flex;align-items:center;gap:7px;border-radius:18px;padding:4px 9px;font-size:12px;font-weight:500;background:var(--canvas)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--ink)}.status[data-vpn-status='online']{color:var(--success)}.status[data-vpn-status='online'] .status-dot{background:var(--success)}.status[data-vpn-status='offline']{color:var(--danger)}.status[data-vpn-status='offline'] .status-dot{background:var(--danger)}.arrow{font-size:18px}.btn{appearance:none;background:var(--canvas);color:var(--ink);border:0;border-radius:var(--control-radius);min-height:36px;padding:8px 13px;text-decoration:none;margin:3px;display:inline-flex;align-items:center;justify-content:center;gap:7px;font:500 14px/1 inherit;cursor:pointer}.btn:hover{background:var(--hairline)}.btn.primary{background:var(--ink);color:var(--paper)}.btn.primary:hover{background:var(--ink-soft)}.btn.outline{background:transparent;box-shadow:inset 0 0 0 1px var(--hairline)}.btn.danger{color:var(--danger);background:transparent}.page-head.has-action{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:18px}.page-head-title{min-width:0}.page-head-action{display:flex;align-items:center;justify-content:flex-end}.vpn-restart-control{display:flex;align-items:center;gap:10px}.vpn-restart-button{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-width:176px;min-height:44px;padding:0 18px;border:1px solid var(--ink);border-radius:var(--control-radius);background:transparent;color:var(--ink);font:600 13px/1 inherit;letter-spacing:.055em;text-transform:uppercase;position:relative;overflow:hidden;isolation:isolate;cursor:pointer;transition:color .35s,border-color .35s,opacity .2s}.vpn-restart-button span{position:relative;z-index:2}.vpn-restart-button::after{position:absolute;content:"";inset:0;width:0;height:100%;background:var(--danger);z-index:1;transition:width .35s}.vpn-restart-button:hover:not(:disabled){color:#fff;border-color:var(--danger)}.vpn-restart-button:hover:not(:disabled)::after,.vpn-restart-button.is-loading::after{width:100%}.vpn-restart-button.is-loading{color:#fff;border-color:var(--danger);cursor:wait}.vpn-restart-button:disabled{opacity:.72}.vpn-restart-button:focus-visible{outline:3px solid color-mix(in srgb,var(--danger) 34%,transparent);outline-offset:3px}.vpn-restart-feedback{max-width:220px;color:var(--muted);font-size:12px}.vpn-restart-feedback[data-state='success']{color:var(--success)}.vpn-restart-feedback[data-state='error']{color:var(--danger)}.theme-toggle{width:40px;padding:0;font-size:17px}.breadcrumb-row{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}.breadcrumb{display:flex;gap:7px;align-items:center;margin:0;color:var(--muted)}.back-button{margin:0;white-space:nowrap}.breadcrumb a{text-decoration:none}.breadcrumb-current{color:var(--ink)}.summary-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 24px}.badge{display:inline-flex;align-items:center;border-radius:18px;padding:3px 9px;font-size:12px;font-weight:500;background:var(--canvas);color:var(--ink-soft)}.badge.solid{background:var(--ink-soft);color:var(--paper)}.tag-scada{--tag-fg:#1d4ed8;--tag-bg:#eff6ff;--tag-border:#bfdbfe}.tag-trackers{--tag-fg:#b45309;--tag-bg:#fffbeb;--tag-border:#fde68a}.tag-inversores{--tag-fg:#15803d;--tag-bg:#f0fdf4;--tag-border:#bbf7d0}.tag-cctv{--tag-fg:#7e22ce;--tag-bg:#faf5ff;--tag-border:#e9d5ff}.tag-set{--tag-fg:#be123c;--tag-bg:#fff1f2;--tag-border:#fecdd3}[data-theme='dark'] .tag-scada{--tag-fg:#93c5fd;--tag-bg:#172554;--tag-border:#1e40af}[data-theme='dark'] .tag-trackers{--tag-fg:#fcd34d;--tag-bg:#451a03;--tag-border:#92400e}[data-theme='dark'] .tag-inversores{--tag-fg:#86efac;--tag-bg:#052e16;--tag-border:#166534}[data-theme='dark'] .tag-cctv{--tag-fg:#d8b4fe;--tag-bg:#3b0764;--tag-border:#7e22ce}[data-theme='dark'] .tag-set{--tag-fg:#fda4af;--tag-bg:#4c0519;--tag-border:#9f1239}.tag-badge{margin:2px 4px 2px 0;color:var(--tag-fg);background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-border)}.equipment-tags{min-width:150px}.tag-filter{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:14px 16px;margin:0 0 14px}.tag-filter-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.tag-filter-options{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.tag-filter-option{display:inline-flex;align-items:center;gap:6px;margin:0;padding:6px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:color-mix(in srgb,var(--tag-bg) 68%,var(--paper));color:var(--tag-fg);font-size:12px;font-weight:600;cursor:pointer;transition:background .15s ease,box-shadow .15s ease,transform .15s ease}.tag-filter-option:hover{background:var(--tag-bg);transform:translateY(-1px)}.tag-filter-option.is-active{background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-fg)}.tag-filter-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.tag-filter-clear{min-height:30px;padding:6px 10px;font-size:12px}.tag-filter-clear:disabled{opacity:.42;cursor:default}.tag-filter-empty{padding:26px;text-align:center}.tag-picker{border:1px solid var(--hairline);border-radius:var(--control-radius);padding:14px 16px;margin:16px 0}.tag-picker legend{font-weight:600;padding:0 6px}.tag-picker p{margin:0 0 8px}.tag-options{display:flex;flex-wrap:wrap;gap:8px}.tag-option{display:inline-flex;align-items:center;gap:7px;margin:0;padding:7px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:var(--tag-bg);color:var(--tag-fg);cursor:pointer}.tag-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.table-card{padding:0;overflow:hidden}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid var(--hairline);padding:14px 16px;text-align:left;vertical-align:middle}th{background:var(--surface);color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--canvas) 65%,transparent)}.sort-button{appearance:none;border:0;background:transparent;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit;padding:0;cursor:pointer;display:inline-flex;align-items:center;gap:6px}.sort-button::after{content:"↕";opacity:.45}.sort-button[data-direction='asc']::after{content:"↑";opacity:1}.sort-button[data-direction='desc']::after{content:"↓";opacity:1}.equipment-name{font-weight:600}.url{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:13px}.muted{color:var(--muted)}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}.vpn-form h3{margin-top:28px;border-bottom:1px solid var(--hairline);padding-bottom:9px}.error{border-color:var(--danger);color:var(--danger)}input,select,textarea{width:100%;padding:10px 12px;background:var(--canvas);color:var(--ink);border:1px solid transparent;border-radius:var(--control-radius);font:inherit;outline:0}input:focus,select:focus,textarea:focus{background:var(--paper);border-color:var(--hairline);box-shadow:0 0 0 3px color-mix(in srgb,var(--ink) 8%,transparent)}label{display:block;margin-top:10px;font-weight:500}.flash{margin-bottom:16px}.empty{text-align:center;padding:40px}.actions{white-space:nowrap}.desktop-only{display:table-cell}
-@media(max-width:760px){.page-head.has-action{grid-template-columns:1fr;align-items:start}.page-head-action{justify-content:flex-start}.vpn-restart-control{align-items:flex-start;flex-direction:column}.vpn-restart-button{min-width:164px}.topbar-inner{padding:9px 14px}.user-chip{display:none}.wrap{padding:28px 14px 48px}.page-head h1{font-size:30px}.plant-grid{grid-template-columns:1fr}.desktop-only{display:none}th,td{padding:12px}.brand-text{display:none}}
+*{box-sizing:border-box}[hidden]{display:none!important}html{background:var(--canvas);color-scheme:light}html[data-theme='dark']{color-scheme:dark}body{font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--canvas);color:var(--ink);margin:0;font-size:14px;line-height:1.43;font-feature-settings:"ss01" 1,"cv11" 1;transition:background .18s ease,color .18s ease}a{color:inherit}.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--surface) 92%,transparent);border-bottom:1px solid var(--hairline);backdrop-filter:blur(14px)}.topbar-inner{max-width:1280px;margin:auto;min-height:64px;padding:10px 24px;display:flex;align-items:center;gap:18px}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:600;letter-spacing:-.025em}.brand-mark{width:28px;height:28px;border-radius:9px;background:var(--ink);color:var(--paper);display:grid;place-items:center;font-size:11px}.nav{margin-left:auto;display:flex;align-items:center;gap:6px}.user-chip{color:var(--muted);padding:8px 10px}.wrap{max-width:1280px;margin:auto;padding:44px 24px 64px}.page-head{margin:0 0 28px}.eyebrow{margin:0 0 8px;color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.page-head h1{font-size:36px;line-height:1.11;letter-spacing:-.025em;margin:0;font-weight:600}.page-head p{max-width:680px;color:var(--muted);font-size:16px}.card{display:block;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:20px;margin:10px 0;color:var(--ink)}a.card{text-decoration:none;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}a.card:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--ink) 22%,var(--hairline))}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.plant-grid{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}.plant-card{min-height:210px;display:flex!important;flex-direction:column;justify-content:space-between}.plant-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.plant-card h2{font-size:24px;line-height:1.33;letter-spacing:-.025em;margin:0}.plant-count{font-size:36px;line-height:1.11;letter-spacing:-.025em;font-weight:600;margin:22px 0 2px}.plant-meta{color:var(--muted);margin:0}.plant-footer{display:flex;align-items:center;justify-content:space-between;margin-top:22px}.status{display:inline-flex;align-items:center;gap:7px;border-radius:18px;padding:4px 9px;font-size:12px;font-weight:500;background:var(--canvas)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--ink)}.status[data-vpn-status='online']{color:var(--success)}.status[data-vpn-status='online'] .status-dot{background:var(--success)}.status[data-vpn-status='offline']{color:var(--danger)}.status[data-vpn-status='offline'] .status-dot{background:var(--danger)}.arrow{font-size:18px}.btn{appearance:none;background:var(--canvas);color:var(--ink);border:0;border-radius:var(--control-radius);min-height:36px;padding:8px 13px;text-decoration:none;margin:3px;display:inline-flex;align-items:center;justify-content:center;gap:7px;font:500 14px/1 inherit;cursor:pointer}.btn:hover{background:var(--hairline)}.btn.primary{background:var(--ink);color:var(--paper)}.btn.primary:hover{background:var(--ink-soft)}.btn.outline{background:transparent;box-shadow:inset 0 0 0 1px var(--hairline)}.btn.danger{color:var(--danger);background:transparent}.page-head.has-action{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:18px}.page-head-title{min-width:0}.page-head-action{display:flex;align-items:center;justify-content:flex-end}.vpn-restart-control{display:flex;align-items:center;gap:10px}.vpn-restart-button{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-width:176px;min-height:44px;padding:0 18px;border:1px solid var(--ink);border-radius:var(--control-radius);background:transparent;color:var(--ink);font:600 13px/1 inherit;letter-spacing:.055em;text-transform:uppercase;position:relative;overflow:hidden;isolation:isolate;cursor:pointer;transition:color .35s,border-color .35s,opacity .2s}.vpn-restart-button span{position:relative;z-index:2}.vpn-restart-button::after{position:absolute;content:"";inset:0;width:0;height:100%;background:var(--danger);z-index:1;transition:width .35s}.vpn-restart-button:hover:not(:disabled){color:#fff;border-color:var(--danger)}.vpn-restart-button:hover:not(:disabled)::after,.vpn-restart-button.is-loading::after{width:100%}.vpn-restart-button.is-loading{color:#fff;border-color:var(--danger);cursor:wait}.vpn-restart-button:disabled{opacity:.72}.vpn-restart-button:focus-visible{outline:3px solid color-mix(in srgb,var(--danger) 34%,transparent);outline-offset:3px}.vpn-restart-feedback{max-width:220px;color:var(--muted);font-size:12px}.vpn-restart-feedback[data-state='success']{color:var(--success)}.vpn-restart-feedback[data-state='error']{color:var(--danger)}.theme-toggle{width:40px;padding:0;font-size:17px}.breadcrumb-row{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}.breadcrumb{display:flex;gap:7px;align-items:center;margin:0;color:var(--muted)}.back-button{margin:0;white-space:nowrap}.breadcrumb a{text-decoration:none}.breadcrumb-current{color:var(--ink)}.summary-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 24px}.badge{display:inline-flex;align-items:center;border-radius:18px;padding:3px 9px;font-size:12px;font-weight:500;background:var(--canvas);color:var(--ink-soft)}.badge.solid{background:var(--ink-soft);color:var(--paper)}.tag-scada{--tag-fg:#1d4ed8;--tag-bg:#eff6ff;--tag-border:#bfdbfe}.tag-trackers{--tag-fg:#b45309;--tag-bg:#fffbeb;--tag-border:#fde68a}.tag-inversores{--tag-fg:#15803d;--tag-bg:#f0fdf4;--tag-border:#bbf7d0}.tag-cctv{--tag-fg:#7e22ce;--tag-bg:#faf5ff;--tag-border:#e9d5ff}.tag-set{--tag-fg:#be123c;--tag-bg:#fff1f2;--tag-border:#fecdd3}[data-theme='dark'] .tag-scada{--tag-fg:#93c5fd;--tag-bg:#172554;--tag-border:#1e40af}[data-theme='dark'] .tag-trackers{--tag-fg:#fcd34d;--tag-bg:#451a03;--tag-border:#92400e}[data-theme='dark'] .tag-inversores{--tag-fg:#86efac;--tag-bg:#052e16;--tag-border:#166534}[data-theme='dark'] .tag-cctv{--tag-fg:#d8b4fe;--tag-bg:#3b0764;--tag-border:#7e22ce}[data-theme='dark'] .tag-set{--tag-fg:#fda4af;--tag-bg:#4c0519;--tag-border:#9f1239}.tag-badge{margin:2px 4px 2px 0;color:var(--tag-fg);background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-border)}.equipment-tags{min-width:150px}.tag-filter{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:14px 16px;margin:0 0 14px}.tag-filter-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.tag-filter-options{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.tag-filter-option{display:inline-flex;align-items:center;gap:6px;margin:0;padding:6px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:color-mix(in srgb,var(--tag-bg) 68%,var(--paper));color:var(--tag-fg);font-size:12px;font-weight:600;cursor:pointer;transition:background .15s ease,box-shadow .15s ease,transform .15s ease}.tag-filter-option:hover{background:var(--tag-bg);transform:translateY(-1px)}.tag-filter-option.is-active{background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-fg)}.tag-filter-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.tag-filter-clear{min-height:30px;padding:6px 10px;font-size:12px}.tag-filter-clear:disabled{opacity:.42;cursor:default}.tag-filter-empty{padding:26px;text-align:center}.tag-picker{border:1px solid var(--hairline);border-radius:var(--control-radius);padding:14px 16px;margin:16px 0}.tag-picker legend{font-weight:600;padding:0 6px}.tag-picker p{margin:0 0 8px}.tag-options{display:flex;flex-wrap:wrap;gap:8px}.tag-option{display:inline-flex;align-items:center;gap:7px;margin:0;padding:7px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:var(--tag-bg);color:var(--tag-fg);cursor:pointer}.tag-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.table-card{padding:0;overflow:hidden}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid var(--hairline);padding:14px 16px;text-align:left;vertical-align:middle}th{background:var(--surface);color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--canvas) 65%,transparent)}.sort-button{appearance:none;border:0;background:transparent;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit;padding:0;cursor:pointer;display:inline-flex;align-items:center;gap:6px}.sort-button::after{content:"↕";opacity:.45}.sort-button[data-direction='asc']::after{content:"↑";opacity:1}.sort-button[data-direction='desc']::after{content:"↓";opacity:1}.equipment-name{font-weight:600}.url{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:13px}.muted{color:var(--muted)}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}.vpn-form h3{margin-top:28px;border-bottom:1px solid var(--hairline);padding-bottom:9px}.error{border-color:var(--danger);color:var(--danger)}input,select,textarea{width:100%;padding:10px 12px;background:var(--canvas);color:var(--ink);border:1px solid transparent;border-radius:var(--control-radius);font:inherit;outline:0}input:focus,select:focus,textarea:focus{background:var(--paper);border-color:var(--hairline);box-shadow:0 0 0 3px color-mix(in srgb,var(--ink) 8%,transparent)}label{display:block;margin-top:10px;font-weight:500}.flash{margin-bottom:16px}.empty{text-align:center;padding:40px}.actions{white-space:nowrap}.desktop-only{display:table-cell}.endpoint-health{min-width:250px;display:grid;gap:8px;line-height:1.35}.endpoint-health-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.endpoint-health-title strong{font-size:13px;line-height:1.3}.endpoint-health-code{display:inline-flex;align-items:center;border:1px solid var(--hairline);border-radius:999px;padding:3px 8px;color:var(--muted);font-size:11px;line-height:1.25}.endpoint-health-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 14px;margin:0}.endpoint-health-meta>div{display:grid;gap:1px;min-width:0}.endpoint-health-meta dt{color:var(--muted);font-size:11px;line-height:1.25}.endpoint-health-meta dd{margin:0;color:var(--ink);font-size:12px;line-height:1.3;white-space:nowrap;font-variant-numeric:tabular-nums}.endpoint-health[data-endpoint-state='healthy'] .endpoint-health-title strong{color:var(--success)}.endpoint-health[data-endpoint-state='down'] .endpoint-health-title strong{color:var(--danger)}.endpoint-health[data-endpoint-state='unknown'] .endpoint-health-title strong{color:var(--muted)}
+@media(max-width:760px){.page-head.has-action{grid-template-columns:1fr;align-items:start}.page-head-action{justify-content:flex-start}.vpn-restart-control{align-items:flex-start;flex-direction:column}.vpn-restart-button{min-width:164px}.topbar-inner{padding:9px 14px}.user-chip{display:none}.wrap{padding:28px 14px 48px}.page-head h1{font-size:30px}.plant-grid{grid-template-columns:1fr}.desktop-only{display:none}.endpoint-health{min-width:220px}.endpoint-health-meta{grid-template-columns:1fr}th,td{padding:12px}.brand-text{display:none}}
 """
 THEME_SCRIPT=r"""<script>(function(){try{var saved=localStorage.getItem('theme');var preferred=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=saved||preferred}catch(e){}})();function syncThemeButton(){var b=document.getElementById('theme-toggle');if(!b)return;var dark=document.documentElement.dataset.theme==='dark';b.textContent=dark?'☀':'☾';b.setAttribute('aria-label',dark?'Activar modo claro':'Activar modo nocturno');b.title=b.getAttribute('aria-label')}function toggleTheme(){var next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;localStorage.setItem('theme',next);syncThemeButton()}document.addEventListener('DOMContentLoaded',syncThemeButton);</script>"""
 SORT_SCRIPT=r"""<script>function sortEquipmentTable(button){var table=document.getElementById('equipment-table'),head=button.closest('th'),index=Array.prototype.indexOf.call(head.parentNode.children,head),body=table.tBodies[0],rows=Array.from(body.rows),direction=button.dataset.direction==='asc'?'desc':'asc';table.querySelectorAll('.sort-button').forEach(function(x){if(x!==button)delete x.dataset.direction});button.dataset.direction=direction;rows.sort(function(a,b){var av=a.cells[index].dataset.sortValue||a.cells[index].textContent.trim(),bv=b.cells[index].dataset.sortValue||b.cells[index].textContent.trim();var result=av.localeCompare(bv,'es',{numeric:true,sensitivity:'base'});return direction==='asc'?result:-result});rows.forEach(function(row){body.appendChild(row)});}</script>"""
@@ -422,7 +669,9 @@ def idx():
             try:online=vpn_runtime(vpn)[0]
             except Exception:online=False
         status='online' if online else 'offline';web=sum(1 for e in items if e['kind']=='WEB');rdp=sum(1 for e in items if e['kind']=='RDP');vnc=sum(1 for e in items if e['kind']=='VNC');href='/plant/'+quote(plant,safe='');equipment_copy='equipo disponible' if len(items)==1 else 'equipos disponibles'
-        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div><div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
+        health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None
+        alert=endpoint_card_alert(health,online,admin_view=me()['role']=='admin')
+        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div>{alert}<div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
     return page('Panel de accesos',b+'</div>')
 @app.route('/plant/<path:plant>')
 @need
@@ -433,9 +682,9 @@ def plant_access(plant):
     if vpn:
         try:online=vpn_runtime(vpn)[0]
         except Exception:online=False
-    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
+    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None;back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
     plant_url=quote(canonical,safe='');head_action=(f"<div class='vpn-restart-control'><button class='vpn-restart-button' type='button' data-restart-url='/plant/{plant_url}/vpn/restart' data-restart-csrf='{h(csrf_token())}' onclick='restartPlantVpn(this)'><span>Reiniciar VPN</span></button><span class='vpn-restart-feedback' id='vpn-restart-feedback' role='status' aria-live='polite'></span></div>" if vpn else '')
-    b=(back+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
+    b=(back+endpoint_card_alert(health,online,admin_view=me()['role']=='admin')+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
     for e in items:
         name=html.escape(e['name']);kind=html.escape(e['kind']);ip=html.escape(e['real_ip']);port=html.escape(str(e['real_port']));desc=html.escape(e['description'] or '—')
         tags=equipment_tag_names(db(),e['id']);tag_sort='|'.join(tag.casefold() for tag in tags);tag_filter=','.join(tag.casefold() for tag in tags);tag_badges=equipment_tag_badges(tags)
@@ -599,6 +848,8 @@ def apply_vpn(v):
 @admin
 def vpns():
     rows=db().execute('SELECT * FROM vpns ORDER BY plant').fetchall();b="<a class='btn primary' href=/admin/vpns/new>Añadir VPN</a><table><tr><th>Planta</th><th>Tipo</th><th>Gateway</th><th>Estado</th><th>IP VPN</th><th></th></tr>"
+    health_by_id=endpoint_health_map(rows)
+    b=b.replace('<th>Estado</th>', '<th>Estado</th><th>Endpoint público</th>', 1)
     for v in rows:
         kind=v['vpn_type'] or 'ssl'
         if kind=='ssl':profile='SSL · openfortivpn'
@@ -616,7 +867,9 @@ def vpns():
             actions+=f"<form method=post action=/admin/vpns/{v['id']}/pause style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn danger' onclick='return confirm(&quot;¿Pausar el contenedor Docker de esta VPN? Se interrumpirán sus accesos WEB/RDP.&quot;)'>Pausar VPN</button></form>"
         elif v['onboarding_state']=='verified_pending_activation':actions+=f"<form method=post action=/admin/vpns/{v['id']}/activate style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn primary'>Activar tras revalidar</button></form>"
         actions+=f"<form method=post action=/admin/vpns/{v['id']}/delete style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class=btn onclick='return confirm(&quot;Eliminar VPN, equipos, permisos, configuración y contenedor asociados?&quot;)'>Eliminar VPN</button></form>"
-        b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(detail)}'>{icon} {h(status)}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
+        normalized_runtime_detail='Online' if online else ('Pausada' if status=='Pausada' else 'VPN no disponible')
+        display_detail = detail if not active else normalized_runtime_detail
+        b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(normalized_runtime_detail)}'>{icon} {h(status)}<br><span class='muted'>{h(display_detail)}</span></td><td>{endpoint_health_admin_markup(health_by_id.get(int(v['id'])))}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
     b+='</table><p class=muted>Los borradores se validan de forma aislada. Solo pasan a activos tras validar control, datos, rutas y destino interno.</p>';return page('VPNs',b)
 
 @app.route('/admin/vpns/<int:i>/activate',methods=['POST'])
