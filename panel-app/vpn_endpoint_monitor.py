@@ -1306,9 +1306,9 @@ class PanelClient:
             },
             method=method,
         )
-        # Pass timeout positionally so injected openers can stay tiny and
-        # urllib.request.urlopen remains the only production HTTP dependency.
-        with self.opener(request, self.timeout) as response:
+        # Pass timeout by keyword: urllib open() treats its second positional
+        # argument as request data, which would reject the float timeout.
+        with self.opener(request, timeout=self.timeout) as response:
             return _decode_json(_read_bounded(response))
 
     def fetch_targets(self) -> list[dict[str, Any]]:
