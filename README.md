@@ -168,6 +168,7 @@ Bastión VPN is OT-adjacent infrastructure. Do not commit secrets, private keys,
 - [FAQ](docs/FAQ.md) — installation, networking, VPN, RDP, and secret handling.
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — evidence-first diagnosis from ingress to target.
 - [Networking](docs/NETWORKING.md) — namespaces, overlapping ranges, and ports.
+- [Promoción del monitor de endpoints VPN](docs/operations/vpn-endpoint-monitor-rollout.md) — versión de `ike-scan`, token, orden gradual y rollback acotado.
 
 ## Roadmap
 

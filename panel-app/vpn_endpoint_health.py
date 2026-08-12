@@ -16,7 +16,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-
 HEALTH_STATES = frozenset({"accessible", "unreachable"})
 PROBE_TYPES = frozenset({"tcp", "ike", "openvpn_udp"})
 VPN_TYPES = frozenset({"ssl", "ipsec", "pptp", "openvpn"})
@@ -36,7 +35,14 @@ MAX_LEASE_ID_LENGTH = 128
 MAX_HEALTH_QUERY_IDS = 500
 
 RESULT_REQUIRED_FIELDS = frozenset(
-    {"vpn_id", "target_revision", "icmp_ok", "protocol_ok", "protocol_probe", "checked_at"}
+    {
+        "vpn_id",
+        "target_revision",
+        "icmp_ok",
+        "protocol_ok",
+        "protocol_probe",
+        "checked_at",
+    }
 )
 RESULT_OPTIONAL_FIELDS = frozenset(
     {
@@ -96,6 +102,20 @@ _HEALTH_COLUMNS = (
     "latency_ms",
 )
 _HEALTH_COLUMN_SQL = ",".join(_HEALTH_COLUMNS)
+_EVENT_COLUMNS = frozenset(
+    {
+        "id",
+        "vpn_id",
+        "old_state",
+        "new_state",
+        "icmp_ok",
+        "protocol_ok",
+        "protocol_probe",
+        "icmp_code",
+        "protocol_code",
+        "created_at",
+    }
+)
 
 
 class StaleRevisionError(ValueError):
@@ -198,14 +218,18 @@ def target_revision(config: Any) -> str:
     if not required <= keys:
         raise ValueError("Missing probe configuration.")
 
-    vpn_type = _enum(str(_required(config, "vpn_type")).strip().lower(), "vpn_type", VPN_TYPES)
+    vpn_type = _enum(
+        str(_required(config, "vpn_type")).strip().lower(), "vpn_type", VPN_TYPES
+    )
     host_raw = _required(config, "host")
     if not isinstance(host_raw, str):
         raise ValueError("Invalid host.")
     host = host_raw.strip().lower().rstrip(".")
     if not 1 <= len(host) <= 253 or any(ord(ch) < 33 or ord(ch) == 127 for ch in host):
         raise ValueError("Invalid host.")
-    transport = _enum(str(_required(config, "transport")).strip().lower(), "transport", TRANSPORTS)
+    transport = _enum(
+        str(_required(config, "transport")).strip().lower(), "transport", TRANSPORTS
+    )
     canonical: dict[str, Any] = {
         "vpn_type": vpn_type,
         "host": host,
@@ -216,23 +240,37 @@ def target_revision(config: Any) -> str:
         "nat_t": False,
     }
     if vpn_type == "ipsec":
-        ike = _enum(str(config.get("ike_version", "ikev1")).strip().lower(), "ike_version", IKE_VERSIONS)
+        ike = _enum(
+            str(config.get("ike_version", "ikev1")).strip().lower(),
+            "ike_version",
+            IKE_VERSIONS,
+        )
         aggressive = config.get("aggressive", False)
         nat_t = config.get("nat_t", config.get("nat_traversal", False))
         if not isinstance(aggressive, bool) or not isinstance(nat_t, bool):
             raise ValueError("IKE mode flags are invalid.")
-        canonical.update(ike_version=ike, aggressive=aggressive if ike == "ikev1" else False, nat_t=nat_t)
+        canonical.update(
+            ike_version=ike,
+            aggressive=aggressive if ike == "ikev1" else False,
+            nat_t=nat_t,
+        )
     elif "aggressive" in keys and not isinstance(config["aggressive"], bool):
         raise ValueError("aggressive must be boolean.")
 
-    payload = json.dumps(canonical, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    payload = json.dumps(
+        canonical, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
 
 
 def _normalise_code(value: Any, label: str, default: str) -> str:
     if value is None:
         return default
-    if not isinstance(value, str) or not _CODE_RE.fullmatch(value) or value not in _CODES:
+    if (
+        not isinstance(value, str)
+        or not _CODE_RE.fullmatch(value)
+        or value not in _CODES
+    ):
         raise ValueError(f"Invalid {label}.")
     return value
 
@@ -250,19 +288,33 @@ def validate_result(result: Any) -> dict[str, Any]:
         "protocol_ok": _strict_bool(_required(result, "protocol_ok"), "protocol_ok"),
         "protocol_probe": probe,
         "checked_at": _timestamp(_required(result, "checked_at")),
-        "icmp_code": _normalise_code(result.get("icmp_code"), "icmp_code", "icmp_reply" if result["icmp_ok"] else "icmp_timeout"),
-        "protocol_code": _normalise_code(result.get("protocol_code"), "protocol_code", "probe_error" if not result["protocol_ok"] else "tcp_accept"),
+        "icmp_code": _normalise_code(
+            result.get("icmp_code"),
+            "icmp_code",
+            "icmp_reply" if result["icmp_ok"] else "icmp_timeout",
+        ),
+        "protocol_code": _normalise_code(
+            result.get("protocol_code"),
+            "protocol_code",
+            "probe_error" if not result["protocol_ok"] else "tcp_accept",
+        ),
         "latency_ms": None,
         "target_generation": 0,
         "cycle_id": 0,
         "lease_id": "",
     }
     if "latency_ms" in keys and result["latency_ms"] is not None:
-        normalized["latency_ms"] = _strict_int(result["latency_ms"], "latency_ms", 0, MAX_LATENCY_MS)
+        normalized["latency_ms"] = _strict_int(
+            result["latency_ms"], "latency_ms", 0, MAX_LATENCY_MS
+        )
     if "target_generation" in keys:
-        normalized["target_generation"] = _strict_int(result["target_generation"], "target_generation", 0, MAX_TARGET_GENERATION)
+        normalized["target_generation"] = _strict_int(
+            result["target_generation"], "target_generation", 0, MAX_TARGET_GENERATION
+        )
     if "cycle_id" in keys:
-        normalized["cycle_id"] = _strict_int(result["cycle_id"], "cycle_id", 0, MAX_CYCLE_ID)
+        normalized["cycle_id"] = _strict_int(
+            result["cycle_id"], "cycle_id", 0, MAX_CYCLE_ID
+        )
     if "lease_id" in keys:
         normalized["lease_id"] = _lease(result["lease_id"])
     return normalized
@@ -300,8 +352,7 @@ def _write_transaction(conn: sqlite3.Connection, savepoint: str):
 
 
 def _create_current_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS vpn_endpoint_health(
+    conn.execute("""CREATE TABLE IF NOT EXISTS vpn_endpoint_health(
             vpn_id INTEGER PRIMARY KEY CHECK(vpn_id BETWEEN 1 AND 9223372036854775807),
             target_revision TEXT NOT NULL CHECK(length(target_revision)=64),
             target_generation INTEGER NOT NULL DEFAULT 0,
@@ -319,10 +370,8 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             last_transition_at INTEGER CHECK(last_transition_at IS NULL OR last_transition_at BETWEEN 0 AND 253402300799),
             updated_at INTEGER NOT NULL DEFAULT 0 CHECK(updated_at BETWEEN 0 AND 253402300799),
             latency_ms INTEGER CHECK(latency_ms IS NULL OR latency_ms BETWEEN 0 AND 60000)
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS vpn_endpoint_health_events(
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS vpn_endpoint_health_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vpn_id INTEGER NOT NULL,
             old_state TEXT NOT NULL CHECK(old_state IN ('accessible','unreachable')),
@@ -333,13 +382,37 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             icmp_code TEXT NOT NULL DEFAULT 'not_checked',
             protocol_code TEXT NOT NULL DEFAULT 'not_checked',
             created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 253402300799)
-        )"""
+        )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_vpn_endpoint_health_events_vpn_id ON vpn_endpoint_health_events(vpn_id)"
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_vpn_endpoint_health_events_vpn_id ON vpn_endpoint_health_events(vpn_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_vpn_endpoint_health_events_created_at ON vpn_endpoint_health_events(created_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_vpn_endpoint_health_events_created_at ON vpn_endpoint_health_events(created_at)"
+    )
 
 
-def _legacy_value(row: sqlite3.Row | tuple[Any, ...], columns: Mapping[str, int], name: str, default: Any = None) -> Any:
+def _complete_event_schema(conn: sqlite3.Connection) -> None:
+    """Add backward-compatible event evidence columns without rewriting history."""
+    columns = {
+        item[1]
+        for item in conn.execute("PRAGMA table_info(vpn_endpoint_health_events)")
+    }
+    if "icmp_code" not in columns:
+        conn.execute(
+            "ALTER TABLE vpn_endpoint_health_events ADD COLUMN icmp_code TEXT NOT NULL DEFAULT 'not_checked'"
+        )
+    if "protocol_code" not in columns:
+        conn.execute(
+            "ALTER TABLE vpn_endpoint_health_events ADD COLUMN protocol_code TEXT NOT NULL DEFAULT 'not_checked'"
+        )
+
+
+def _legacy_value(
+    row: sqlite3.Row | tuple[Any, ...],
+    columns: Mapping[str, int],
+    name: str,
+    default: Any = None,
+) -> Any:
     if name not in columns:
         return default
     try:
@@ -349,10 +422,14 @@ def _legacy_value(row: sqlite3.Row | tuple[Any, ...], columns: Mapping[str, int]
         return row[index] if index is not None and index < len(row) else default
 
 
-def _migrate_legacy_health(conn: sqlite3.Connection, columns: Mapping[str, int]) -> None:
+def _migrate_legacy_health(
+    conn: sqlite3.Connection, columns: Mapping[str, int]
+) -> None:
     """Migrate the previous multi-state table without touching VPN lifecycle data."""
     legacy_name = "vpn_endpoint_health_legacy_migration"
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (legacy_name,)).fetchone():
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (legacy_name,)
+    ).fetchone():
         conn.execute(f"DROP TABLE {legacy_name}")
     conn.execute(f"ALTER TABLE vpn_endpoint_health RENAME TO {legacy_name}")
     _create_current_schema(conn)
@@ -361,12 +438,18 @@ def _migrate_legacy_health(conn: sqlite3.Connection, columns: Mapping[str, int])
     for row in rows:
         vpn_id = _legacy_value(row, columns, "vpn_id")
         revision = _legacy_value(row, columns, "target_revision")
-        if not isinstance(vpn_id, int) or not isinstance(revision, str) or not _REVISION_RE.fullmatch(revision):
+        if (
+            not isinstance(vpn_id, int)
+            or not isinstance(revision, str)
+            or not _REVISION_RE.fullmatch(revision)
+        ):
             continue
         old_state = str(_legacy_value(row, columns, "state", "accessible"))
         state = "unreachable" if old_state in {"down", "unreachable"} else "accessible"
         probe = str(_legacy_value(row, columns, "protocol_probe", "tcp_connect"))
-        probe = {"tcp_connect": "tcp", "openvpn_udp": "openvpn_udp", "ike": "ike"}.get(probe, "tcp")
+        probe = {"tcp_connect": "tcp", "openvpn_udp": "openvpn_udp", "ike": "ike"}.get(
+            probe, "tcp"
+        )
         last_checked = _legacy_value(row, columns, "last_checked_at")
         if not isinstance(last_checked, int):
             last_checked = _legacy_value(row, columns, "observed_at")
@@ -377,7 +460,9 @@ def _migrate_legacy_health(conn: sqlite3.Connection, columns: Mapping[str, int])
             legacy_protocol_ok = int(legacy_outcome == "reachable")
         legacy_protocol_code = _legacy_value(row, columns, "protocol_code")
         if legacy_protocol_code is None:
-            legacy_protocol_code = _legacy_value(row, columns, "public_code", "not_checked")
+            legacy_protocol_code = _legacy_value(
+                row, columns, "public_code", "not_checked"
+            )
         conn.execute(
             """INSERT INTO vpn_endpoint_health(
                 vpn_id,target_revision,target_generation,cycle_id,lease_id,state,consecutive_failures,
@@ -391,7 +476,15 @@ def _migrate_legacy_health(conn: sqlite3.Connection, columns: Mapping[str, int])
                 int(_legacy_value(row, columns, "cycle_id", 0) or 0),
                 str(_legacy_value(row, columns, "lease_id", "legacy") or "legacy"),
                 state,
-                min(max(int(_legacy_value(row, columns, "consecutive_failures", 0) or 0), 0), MAX_CONSECUTIVE_FAILURES),
+                min(
+                    max(
+                        int(
+                            _legacy_value(row, columns, "consecutive_failures", 0) or 0
+                        ),
+                        0,
+                    ),
+                    MAX_CONSECUTIVE_FAILURES,
+                ),
                 _legacy_value(row, columns, "icmp_ok"),
                 legacy_protocol_ok,
                 probe,
@@ -411,16 +504,27 @@ def ensure_endpoint_health_schema(conn: sqlite3.Connection) -> None:
     """Create/migrate health tables idempotently and atomically."""
     configure_sqlite_connection(conn)
     with _write_transaction(conn, "endpoint_health_schema"):
-        row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vpn_endpoint_health'").fetchone()
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='vpn_endpoint_health'"
+        ).fetchone()
         if row:
-            columns = {item[1]: item[0] for item in conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
-            if "icmp_ok" not in columns or "updated_at" not in columns:
+            columns = {
+                item[1]: item[0]
+                for item in conn.execute("PRAGMA table_info(vpn_endpoint_health)")
+            }
+            if not set(_HEALTH_COLUMNS) <= columns.keys():
                 _migrate_legacy_health(conn, columns)
             else:
                 _create_current_schema(conn)
         else:
             _create_current_schema(conn)
         _create_current_schema(conn)
+        event_columns = {
+            item[1]
+            for item in conn.execute("PRAGMA table_info(vpn_endpoint_health_events)")
+        }
+        if not _EVENT_COLUMNS <= event_columns:
+            _complete_event_schema(conn)
 
 
 def _health_row(conn: sqlite3.Connection, vpn_id: int) -> dict[str, Any] | None:
@@ -432,7 +536,9 @@ def _health_row(conn: sqlite3.Connection, vpn_id: int) -> dict[str, Any] | None:
 
 
 def _purge_events(conn: sqlite3.Connection, cutoff: int) -> None:
-    conn.execute("DELETE FROM vpn_endpoint_health_events WHERE created_at < ?", (cutoff,))
+    conn.execute(
+        "DELETE FROM vpn_endpoint_health_events WHERE created_at < ?", (cutoff,)
+    )
 
 
 def apply_probe_result(
@@ -446,27 +552,61 @@ def apply_probe_result(
     normalized = validate_result(result)
     expected = _revision(expected_revision)
     if normalized["target_revision"] != expected:
-        raise StaleRevisionError("The result revision does not match the current target revision.")
-    generation = normalized["target_generation"] if expected_generation is None else _strict_int(expected_generation, "expected_generation", 0, MAX_TARGET_GENERATION)
+        raise StaleRevisionError(
+            "The result revision does not match the current target revision."
+        )
+    generation = (
+        normalized["target_generation"]
+        if expected_generation is None
+        else _strict_int(
+            expected_generation, "expected_generation", 0, MAX_TARGET_GENERATION
+        )
+    )
     if normalized["target_generation"] != generation:
-        raise StaleRevisionError("The endpoint target generation changed before this result arrived.")
+        raise StaleRevisionError(
+            "The endpoint target generation changed before this result arrived."
+        )
 
     with _write_transaction(conn, "endpoint_health_apply"):
         previous = _health_row(conn, normalized["vpn_id"])
-        if previous and normalized["target_generation"] < int(previous["target_generation"]):
-            raise StaleRevisionError("The endpoint target generation is older than stored state.")
+        if previous and normalized["target_generation"] < int(
+            previous["target_generation"]
+        ):
+            raise StaleRevisionError(
+                "The endpoint target generation is older than stored state."
+            )
         revision_changed = bool(previous and previous["target_revision"] != expected)
-        generation_changed = normalized["target_generation"] != (int(previous["target_generation"]) if previous else -1)
-        if previous and not revision_changed and normalized["target_generation"] == int(previous["target_generation"]):
+        generation_changed = normalized["target_generation"] != (
+            int(previous["target_generation"]) if previous else -1
+        )
+        if (
+            previous
+            and not revision_changed
+            and normalized["target_generation"] == int(previous["target_generation"])
+        ):
             previous_cycle = int(previous["cycle_id"])
             if normalized["cycle_id"] and normalized["cycle_id"] < previous_cycle:
                 raise StaleCycleError("The endpoint cycle is older than stored state.")
-            if normalized["cycle_id"] == previous_cycle and normalized["cycle_id"] and normalized["lease_id"] == previous["lease_id"]:
+            if (
+                normalized["cycle_id"] == previous_cycle
+                and normalized["cycle_id"]
+                and normalized["lease_id"] == previous["lease_id"]
+            ):
                 return previous
-            if normalized["cycle_id"] == previous_cycle and normalized["cycle_id"] and normalized["lease_id"] != previous["lease_id"]:
-                raise StaleCycleError("The endpoint cycle lease does not match stored state.")
-            if previous["last_checked_at"] is not None and normalized["checked_at"] < int(previous["last_checked_at"]):
-                raise StaleCycleError("The endpoint observation is older than stored state.")
+            if (
+                normalized["cycle_id"] == previous_cycle
+                and normalized["cycle_id"]
+                and normalized["lease_id"] != previous["lease_id"]
+            ):
+                raise StaleCycleError(
+                    "The endpoint cycle lease does not match stored state."
+                )
+            if previous["last_checked_at"] is not None and normalized[
+                "checked_at"
+            ] < int(previous["last_checked_at"]):
+                raise StaleCycleError(
+                    "The endpoint observation is older than stored state."
+                )
 
         old_state = str(previous["state"]) if previous else "accessible"
         failures = int(previous["consecutive_failures"] or 0) if previous else 0
@@ -481,9 +621,17 @@ def apply_probe_result(
             new_state = "unreachable" if failures >= FAILURE_THRESHOLD else old_state
             last_success = previous["last_success_at"] if previous else None
         transitioned = previous is not None and new_state != old_state
-        last_transition = checked_at if transitioned else (previous["last_transition_at"] if previous else None)
-        cycle_id = normalized["cycle_id"] or (int(previous["cycle_id"]) + 1 if previous else 1)
-        lease_id = normalized["lease_id"] or (str(previous["lease_id"]) if previous else "legacy")
+        last_transition = (
+            checked_at
+            if transitioned
+            else (previous["last_transition_at"] if previous else None)
+        )
+        cycle_id = normalized["cycle_id"] or (
+            int(previous["cycle_id"]) + 1 if previous else 1
+        )
+        lease_id = normalized["lease_id"] or (
+            str(previous["lease_id"]) if previous else "legacy"
+        )
         if revision_changed or generation_changed:
             failures = 0
             last_success = None
@@ -521,10 +669,23 @@ def apply_probe_result(
                 updated_at=excluded.updated_at,
                 latency_ms=excluded.latency_ms""",
             (
-                normalized["vpn_id"], expected, normalized["target_generation"], cycle_id, lease_id,
-                new_state, failures, int(normalized["icmp_ok"]), int(normalized["protocol_ok"]),
-                normalized["protocol_probe"], normalized["icmp_code"], normalized["protocol_code"],
-                checked_at, last_success, last_transition, now, normalized["latency_ms"],
+                normalized["vpn_id"],
+                expected,
+                normalized["target_generation"],
+                cycle_id,
+                lease_id,
+                new_state,
+                failures,
+                int(normalized["icmp_ok"]),
+                int(normalized["protocol_ok"]),
+                normalized["protocol_probe"],
+                normalized["icmp_code"],
+                normalized["protocol_code"],
+                checked_at,
+                last_success,
+                last_transition,
+                now,
+                normalized["latency_ms"],
             ),
         )
         if transitioned:
@@ -533,9 +694,15 @@ def apply_probe_result(
                     vpn_id,old_state,new_state,icmp_ok,protocol_ok,protocol_probe,icmp_code,protocol_code,created_at
                 ) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
-                    normalized["vpn_id"], old_state, new_state, int(normalized["icmp_ok"]),
-                    int(normalized["protocol_ok"]), normalized["protocol_probe"], normalized["icmp_code"],
-                    normalized["protocol_code"], checked_at,
+                    normalized["vpn_id"],
+                    old_state,
+                    new_state,
+                    int(normalized["icmp_ok"]),
+                    int(normalized["protocol_ok"]),
+                    normalized["protocol_probe"],
+                    normalized["icmp_code"],
+                    normalized["protocol_code"],
+                    checked_at,
                 ),
             )
         _purge_events(conn, checked_at - HISTORY_SECONDS)
@@ -570,7 +737,9 @@ def _unknown_health(vpn_id: int) -> dict[str, Any]:
     }
 
 
-def health_for_vpns(conn: sqlite3.Connection, vpn_ids: Any, *, now: int | None = None) -> dict[int, dict[str, Any]]:
+def health_for_vpns(
+    conn: sqlite3.Connection, vpn_ids: Any, *, now: int | None = None
+) -> dict[int, dict[str, Any]]:
     """Return current state; staleness is metadata, never a third public state."""
     if isinstance(vpn_ids, (str, bytes)):
         raise ValueError("vpn_ids must be an iterable of integers.")
@@ -590,7 +759,9 @@ def health_for_vpns(conn: sqlite3.Connection, vpn_ids: Any, *, now: int | None =
     result = {vpn_id: _unknown_health(vpn_id) for vpn_id in ids}
     if not ids:
         return result
-    checked_now = int(time.time()) if now is None else _strict_int(now, "now", 0, MAX_TIMESTAMP)
+    checked_now = (
+        int(time.time()) if now is None else _strict_int(now, "now", 0, MAX_TIMESTAMP)
+    )
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         f"SELECT {_HEALTH_COLUMN_SQL} FROM vpn_endpoint_health WHERE vpn_id IN ({placeholders})",
@@ -601,7 +772,9 @@ def health_for_vpns(conn: sqlite3.Connection, vpn_ids: Any, *, now: int | None =
         checked = item["last_checked_at"]
         item["stored_state"] = item["state"]
         item["has_checked"] = checked is not None
-        item["is_stale"] = checked is not None and checked_now - int(checked) > STALE_AFTER_SECONDS
+        item["is_stale"] = (
+            checked is not None and checked_now - int(checked) > STALE_AFTER_SECONDS
+        )
         result[item["vpn_id"]] = item
     return result
 
@@ -627,7 +800,9 @@ def history_intervals(
     """Rebuild state intervals from transition events, not per-minute samples."""
     vpn_id = _strict_int(vpn_id, "vpn_id", 1, MAX_VPN_ID)
     history_hours = _strict_int(history_hours, "history_hours", 1, 24 * 30)
-    checked_now = int(time.time()) if now is None else _strict_int(now, "now", 0, MAX_TIMESTAMP)
+    checked_now = (
+        int(time.time()) if now is None else _strict_int(now, "now", 0, MAX_TIMESTAMP)
+    )
     start = max(0, checked_now - history_hours * 3600)
     events = conn.execute(
         """SELECT old_state,new_state,icmp_ok,protocol_ok,protocol_probe,icmp_code,protocol_code,created_at
@@ -636,7 +811,9 @@ def history_intervals(
            ORDER BY created_at,id""",
         (vpn_id, start, checked_now),
     ).fetchall()
-    health = health_for_vpns(conn, [vpn_id], now=checked_now).get(vpn_id) or _unknown_health(vpn_id)
+    health = health_for_vpns(conn, [vpn_id], now=checked_now).get(
+        vpn_id
+    ) or _unknown_health(vpn_id)
     state = str(events[0]["old_state"] if events else health.get("state", "accessible"))
     cursor = start
     evidence: dict[str, Any] = {
@@ -650,18 +827,24 @@ def history_intervals(
     for event in events:
         at = int(event["created_at"])
         if at > cursor:
-            intervals.append({"start_at": cursor, "end_at": at, "state": state, **evidence})
+            intervals.append(
+                {"start_at": cursor, "end_at": at, "state": state, **evidence}
+            )
         state = str(event["new_state"])
         evidence = {
             "icmp_ok": bool(event["icmp_ok"]) if event["icmp_ok"] is not None else None,
-            "protocol_ok": bool(event["protocol_ok"]) if event["protocol_ok"] is not None else None,
+            "protocol_ok": (
+                bool(event["protocol_ok"]) if event["protocol_ok"] is not None else None
+            ),
             "protocol_probe": event["protocol_probe"],
             "icmp_code": event["icmp_code"],
             "protocol_code": event["protocol_code"],
         }
         cursor = max(cursor, at)
     if cursor < checked_now:
-        intervals.append({"start_at": cursor, "end_at": checked_now, "state": state, **evidence})
+        intervals.append(
+            {"start_at": cursor, "end_at": checked_now, "state": state, **evidence}
+        )
     return intervals
 
 

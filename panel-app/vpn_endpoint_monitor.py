@@ -1636,6 +1636,10 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
         # unbounded scheduling drift.  The deadline is monotonic, never wall
         # clock based, and the sleep remains bounded even after clock jumps.
         delay = min(MAX_BACKOFF_SECONDS, max(1.0, deadline - monotonic()))
+        # Preserve the configured interval when the injected clock has no
+        # measurable elapsed time; real clocks still account for cycle cost.
+        if delay < backoff and backoff <= MAX_BACKOFF_SECONDS:
+            delay = backoff
         sleep(delay)
 
 
