@@ -28,6 +28,24 @@ rows are normalized to `accessible` or `unreachable`; transition events remain
 separate. Recovery is restoration of the verified database backup and previous
 immutable images, not a destructive down-migration.
 
+### Migration recovery drill
+
+The migration is intentionally forward-only. Before the panel is promoted,
+exercise the recovery boundary on a disposable copy:
+
+```bash
+sqlite3 /path/to/panel.db ".backup '/tmp/panel.db.pre-monitor'"
+sqlite3 /tmp/panel.db.pre-monitor "PRAGMA integrity_check;"
+# Run the panel migration twice against a disposable copy.
+sqlite3 /tmp/panel.db.pre-monitor "PRAGMA integrity_check;"
+```
+
+The expected result is `ok` after both runs, with the original `vpns` rows
+unchanged and the endpoint-health tables present. If a real promotion fails,
+stop only `panel` and `vpn-endpoint-monitor`, restore the verified backup using
+the approved SQLite backup procedure, and then restore the previous immutable
+images. Never attempt an ad-hoc `ALTER TABLE` rollback on the live database.
+
 ## Token generation and token rotation
 
 Generate the monitor token outside Git with at least 32 random printable bytes.
@@ -63,6 +81,19 @@ time:
 Logs may contain only normalized codes, IDs, cycle metadata, and bounded timing.
 Never collect raw `ping` or `ike-scan` output, endpoint inventories, credentials,
 or packet payloads.
+
+## Toolchain verification
+
+The monitor image pins the Debian package `ike-scan=1.9.5-2` and includes
+`iputils-ping`. Verify the exact package versions before promotion:
+
+```bash
+docker run --rm --entrypoint sh "$MONITOR_IMAGE" -c \
+  'dpkg-query -W -f="${Package}=${Version}\\n" ike-scan iputils-ping'
+```
+
+The output must contain `ike-scan=1.9.5-2`. A different package version or a
+changed image digest invalidates the reviewed promotion bundle.
 
 ## Rollback
 
