@@ -1631,11 +1631,12 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
             return completed
         backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** max(0, failure_streak - 1)))
         delay = min(MAX_BACKOFF_SECONDS, max(1.0, backoff + float(jitter(backoff))))
-        deadline = monotonic() + delay
-        # Account for cycle execution time so a slow cycle cannot create an
-        # unbounded scheduling drift.  The deadline is monotonic, never wall
-        # clock based, and the sleep remains bounded even after clock jumps.
-        delay = min(MAX_BACKOFF_SECONDS, max(1.0, deadline - monotonic()))
+        # Keep one monotonic sample for the deadline.  This accounts for the
+        # cycle duration without introducing sub-microsecond noise into the
+        # configured interval.
+        started_at = monotonic()
+        deadline = started_at + delay
+        delay = min(MAX_BACKOFF_SECONDS, max(1.0, deadline - started_at))
         sleep(delay)
 
 
