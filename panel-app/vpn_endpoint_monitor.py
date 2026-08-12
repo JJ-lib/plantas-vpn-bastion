@@ -1152,15 +1152,19 @@ def probe_icmp(
     function = _icmp_runner_function(runner)
     successes = 0
     started = _clock_monotonic(clock)
+    deadline = started + float(active_limits.timeout_seconds)
     for attempt in range(2):
         address = eligible[attempt % len(eligible)]
+        remaining = deadline - _clock_monotonic(clock)
+        if remaining <= 0:
+            break
         try:
             completed = function(
                 ["ping", "-n", "-c", "1", "-W", "1", address],
                 shell=False,
                 capture_output=True,
                 text=False,
-                timeout=min(1.0, float(active_limits.timeout_seconds)),
+                timeout=min(1.0, remaining),
                 check=False,
             )
             returncode = completed.get("returncode") if isinstance(completed, Mapping) else getattr(completed, "returncode", 1)

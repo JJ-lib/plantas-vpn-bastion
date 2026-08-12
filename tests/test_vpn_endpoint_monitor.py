@@ -241,6 +241,33 @@ class IcmpTests(unittest.TestCase):
         self.assertFalse(result["icmp_ok"])
         self.assertEqual(result["icmp_code"], "icmp_timeout")
 
+    def test_two_attempts_share_one_total_timeout_budget(self):
+        class AdvancingClock:
+            def __init__(self):
+                self.now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = AdvancingClock()
+        timeouts = []
+
+        def runner(_argv, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            clock.now += 0.4
+            return SimpleNamespace(returncode=1)
+
+        result = probe_icmp(
+            ["8.8.8.8"],
+            runner=runner,
+            clock=clock,
+            limits=ProbeLimits(timeout_seconds=0.5),
+        )
+        self.assertFalse(result["icmp_ok"])
+        self.assertEqual(len(timeouts), 2)
+        self.assertEqual(timeouts[0], 0.5)
+        self.assertAlmostEqual(timeouts[1], 0.1)
+
 
 class CombinedCycleTests(unittest.TestCase):
     def test_icmp_success_protocol_failure_is_accessible(self):
