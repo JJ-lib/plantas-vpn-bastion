@@ -28,10 +28,9 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
             "${MONITOR_IMAGE:?Set MONITOR_IMAGE to an immutable image reference}",
         )
         command = self.monitor["command"]
-        self.assertIn("60", command)
-        self.assertEqual(command[command.index("--interval") + 1], "60")
+        self.assertEqual(command, ["--interval", "60"])
         self.assertNotIn("300", command)
-        self.assertEqual(self.monitor["healthcheck"]["test"][-1], "--healthcheck")
+        self.assertEqual(self.monitor["healthcheck"]["test"], ["CMD", "python", "-u", "vpn_endpoint_monitor.py", "--healthcheck"])
 
     def test_monitor_has_no_database_docker_project_or_host_access(self):
         serialized = repr(self.monitor).lower()

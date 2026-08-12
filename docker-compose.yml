@@ -37,7 +37,7 @@ services:
       com.plantas-vpn-bastion.egress-policy: deny-private-linklocal-cgnat-reserved
       com.plantas-vpn-bastion.egress-policy-required: "true"
     restart: unless-stopped
-    command: ["python", "-m", "vpn_endpoint_monitor", "--interval", "60"]
+    command: ["--interval", "60"]
     environment:
       PANEL_INTERNAL_URL: http://panel:5000
       VPN_ENDPOINT_MONITOR_TOKEN_FILE: /run/secrets/monitor-token
@@ -66,7 +66,7 @@ services:
     depends_on:
       - panel
     healthcheck:
-      test: ["CMD", "python", "-m", "vpn_endpoint_monitor", "--healthcheck"]
+      test: ["CMD", "python", "-u", "vpn_endpoint_monitor.py", "--healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
