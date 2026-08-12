@@ -28,6 +28,10 @@ The tracked `.env.example` documents names only:
 
 Use a secret manager or a protected root-owned `.env` file with mode `0600`. Never print values during diagnostics.
 
+### Pinned IKE probe
+
+The monitor image installs the Debian Bookworm package `ike-scan=1.9.5-2`. The packaged upstream binary reports `ike-scan 1.9.6`; both values are intentional and are verified during image validation. The monitor invokes only the credential-free, allowlisted adapter and never supplies PSKs, certificates, or VPN profiles.
+
 ## Root Compose services
 
 - `panel` — Flask application and administrative control plane;

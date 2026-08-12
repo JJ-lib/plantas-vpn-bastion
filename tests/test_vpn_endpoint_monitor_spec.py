@@ -58,6 +58,13 @@ class FinalHealthContractTests(unittest.TestCase):
         value.update(extra)
         return value
 
+    def test_ike_scan_package_pin_is_documented_and_fixed(self):
+        dockerfile = (ROOT / "images" / "vpn-endpoint-monitor" / "Dockerfile").read_text(encoding="utf-8")
+        configuration = (ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+        self.assertIn("ike-scan=1.9.5-2", dockerfile)
+        self.assertIn("ike-scan 1.9.6", configuration)
+        self.assertIn("Debian Bookworm package `ike-scan=1.9.5-2`", configuration)
+
     def test_schema_exposes_only_two_public_states_and_transition_events(self):
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
         event_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(vpn_endpoint_health_events)")}
