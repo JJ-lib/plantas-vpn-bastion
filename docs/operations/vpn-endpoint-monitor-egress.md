@@ -23,8 +23,23 @@ The Compose labels
 `com.plantas-vpn-bastion.monitor-egress-policy=deny-private-linklocal-cgnat-reserved`
 are the discovery contract for the host firewall/controller. A deployment
 must fail closed if those labels are not mapped to an enforced host policy.
-The repository does not install host firewall rules and the monitor container
-does not receive `NET_ADMIN`, `NET_RAW`, or Docker-socket access.
+The repository does not install host firewall rules. The monitor receives no
+`NET_ADMIN` or Docker-socket access. It drops every capability and adds back
+only `NET_RAW`, which is required by the pinned `iputils-ping` ICMP binary and
+by `ike-scan=1.9.5-2`. The image contains no VPN authentication material.
+
+Required outbound traffic is limited to:
+
+- ICMP Echo to sanitized public endpoint addresses;
+- TCP to the configured public SSL-VPN, OpenVPN TCP, or PPTP control port;
+- UDP/500 and, when NAT-T applies, UDP/4500 for credential-free `ike-scan`;
+- the configured OpenVPN UDP public port;
+- DNS through the deployment-approved resolver;
+- HTTP to `panel:5000` only on the internal Compose network.
+
+`NET_RAW` does not replace the host egress policy. Before activation, verify
+that the policy blocks private, link-local, CGNAT, metadata, multicast, and
+reserved destinations even if DNS changes after configuration.
 
 ## Promotion gate
 

@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_PATH = ROOT / "docker-compose.yml"
 CADDY_PATH = ROOT / "caddy" / "Caddyfile"
 ENV_PATH = ROOT / ".env.example"
+MONITOR_DOCKERFILE = ROOT / "images" / "vpn-endpoint-monitor" / "Dockerfile"
+EGRESS_RUNBOOK = ROOT / "docs" / "operations" / "vpn-endpoint-monitor-egress.md"
+DEPLOYMENT_RUNBOOK = ROOT / "docs" / "operations" / "vpn-endpoint-monitor-deployment.md"
 
 
 class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
@@ -21,6 +24,8 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
         cls.panel = cls.services["panel"]
         cls.caddy_text = CADDY_PATH.read_text(encoding="utf-8")
         cls.env_text = ENV_PATH.read_text(encoding="utf-8")
+        cls.monitor_dockerfile = MONITOR_DOCKERFILE.read_text(encoding="utf-8")
+        cls.egress_runbook = EGRESS_RUNBOOK.read_text(encoding="utf-8")
 
     def test_monitor_uses_immutable_image_and_sixty_second_interval(self):
         self.assertEqual(
@@ -58,6 +63,31 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
         self.assertTrue(any(re.search(r"(?:^|:)size=\d+[kmg]?(?:,|$)", item, re.I) for item in tmpfs))
         for item in tmpfs:
             self.assertNotIn("size=0", item.lower())
+
+    def test_monitor_toolchain_and_capability_are_pinned_and_documented(self):
+        self.assertIn("ike-scan=1.9.5-2", self.monitor_dockerfile)
+        self.assertIn("iputils-ping", self.monitor_dockerfile)
+        self.assertEqual(self.monitor["cap_add"], ["NET_RAW"])
+        self.assertIn("NET_RAW", self.egress_runbook)
+        self.assertIn("ICMP", self.egress_runbook)
+        self.assertIn("ike-scan", self.egress_runbook)
+        self.assertNotIn("does not receive `NET_ADMIN`, `NET_RAW`", self.egress_runbook)
+
+    def test_deployment_runbook_covers_compatibility_rotation_and_rollback(self):
+        text = DEPLOYMENT_RUNBOOK.read_text(encoding="utf-8")
+        required = (
+            "panel first",
+            "target_revision",
+            "token rotation",
+            "database backup",
+            "integrity_check",
+            "--no-deps",
+            "rollback",
+            "one complete cycle",
+        )
+        for marker in required:
+            with self.subTest(marker=marker):
+                self.assertIn(marker, text.lower())
 
     def test_panel_and_monitor_share_external_read_only_token_secret(self):
         self.assertIn("monitor_token", self.compose["secrets"])

@@ -62,6 +62,10 @@ Use the published TLS/HTTP entrypoint appropriate to your environment. Do not ex
 7. Enable user-facing publication and run one scoped canary.
 8. Record the result and retain the previous known-good bundle for rollback.
 
+For endpoint-monitor schema compatibility, coordinated token rotation, scoped
+promotion, persistence checks, and rollback, follow the
+[endpoint monitor deployment runbook](operations/vpn-endpoint-monitor-deployment.md).
+
 ## 7. Verify and observe
 
 ```bash
