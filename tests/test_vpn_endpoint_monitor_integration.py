@@ -122,6 +122,61 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
             "${VPN_ENDPOINT_MONITOR_TARGET_IDS}",
         )
 
+    def test_monitor_uses_dedicated_statically_addressed_egress_network(self):
+        monitor_networks = self.monitor["networks"]
+        panel_networks = self.panel["networks"]
+        self.assertEqual(
+            monitor_networks["monitor-egress"]["ipv4_address"],
+            "${VPN_ENDPOINT_MONITOR_EGRESS_IPV4:-172.30.250.2}",
+        )
+        self.assertEqual(
+            monitor_networks["monitor-api"]["ipv4_address"],
+            "${VPN_ENDPOINT_MONITOR_API_IPV4:-172.30.250.10}",
+        )
+        self.assertEqual(
+            panel_networks["monitor-api"]["ipv4_address"],
+            "${VPN_ENDPOINT_PANEL_API_IPV4:-172.30.250.11}",
+        )
+        self.assertEqual(panel_networks["bastion"]["gw_priority"], 1)
+        self.assertEqual(monitor_networks["monitor-egress"]["gw_priority"], 1)
+        self.assertNotIn("bastion", monitor_networks)
+        egress = self.compose["networks"]["monitor-egress"]
+        api = self.compose["networks"]["monitor-api"]
+        self.assertEqual(egress["name"], "vpn_endpoint_monitor_egress")
+        self.assertEqual(egress["driver_opts"]["com.docker.network.bridge.name"], "vpnmon-egress0")
+        self.assertIs(egress["internal"], False)
+        self.assertIs(egress["enable_ipv6"], False)
+        self.assertEqual(
+            egress["ipam"]["config"][0]["subnet"],
+            "${VPN_ENDPOINT_MONITOR_EGRESS_SUBNET:-172.30.250.0/29}",
+        )
+        self.assertIs(api["internal"], True)
+        self.assertEqual(api["driver_opts"]["com.docker.network.bridge.name"], "vpnmon-api0")
+
+    def test_persistent_host_firewall_artifacts_are_fail_closed(self):
+        firewall = (ROOT / "firewall" / "vpn-endpoint-monitor.nft").read_text(encoding="utf-8")
+        service = (ROOT / "systemd" / "vpn-endpoint-monitor-egress.service").read_text(encoding="utf-8")
+        self.assertIn('iifname "vpnmon-egress0" jump monitor_egress', firewall)
+        self.assertIn('iifname "vpnmon-api0" oifname != "vpnmon-api0" drop', firewall)
+        established = firewall.index(
+            'oifname { "vpnmon-api0", "vpnmon-egress0" } ct state established,related accept'
+        )
+        inbound_drop = firewall.index('oifname "vpnmon-egress0" iifname != "vpnmon-egress0" drop')
+        self.assertLess(established, inbound_drop)
+        self.assertIn('oifname "vpnmon-api0" iifname != "vpnmon-api0" drop', firewall)
+        self.assertIn('oifname "vpnmon-egress0" iifname != "vpnmon-egress0" drop', firewall)
+        self.assertIn('iifname { "vpnmon-api0", "vpnmon-egress0" } drop', firewall)
+        self.assertIn(
+            'ip saddr 172.30.250.10 ip daddr 172.30.250.11 tcp dport 5000 accept',
+            firewall,
+        )
+        self.assertIn("ct state established,related accept", firewall)
+        self.assertIn("Before=docker.service", service)
+        self.assertIn("ExecStart=/usr/sbin/nft -f /etc/nftables.d/vpn-endpoint-monitor.nft", service)
+        self.assertIn("RequiredBy=docker.service", service)
+        self.assertIn("PartOf=docker.service", service)
+        self.assertIn("After=nftables.service", service)
+
 
 if __name__ == "__main__":
     unittest.main()

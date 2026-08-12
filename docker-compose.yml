@@ -28,7 +28,10 @@ services:
         gid: "0"
         mode: "0440"
     networks:
-      - bastion
+      bastion:
+        gw_priority: 1
+      monitor-api:
+        ipv4_address: ${VPN_ENDPOINT_PANEL_API_IPV4:-172.30.250.11}
 
   vpn-endpoint-monitor:
     image: ${MONITOR_IMAGE:?Set MONITOR_IMAGE to an immutable image reference}
@@ -62,7 +65,11 @@ services:
     tmpfs:
       - /tmp:size=16m,noexec,nosuid,nodev
     networks:
-      - bastion
+      monitor-api:
+        ipv4_address: ${VPN_ENDPOINT_MONITOR_API_IPV4:-172.30.250.10}
+      monitor-egress:
+        ipv4_address: ${VPN_ENDPOINT_MONITOR_EGRESS_IPV4:-172.30.250.2}
+        gw_priority: 1
     depends_on:
       - panel
     healthcheck:
@@ -135,6 +142,26 @@ networks:
     name: bastion_net
     labels:
       com.plantas-vpn-bastion.monitor-egress-policy: deny-private-linklocal-cgnat-reserved
+  monitor-api:
+    name: vpn_endpoint_monitor_api
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: vpnmon-api0
+    ipam:
+      config:
+        - subnet: ${VPN_ENDPOINT_MONITOR_API_SUBNET:-172.30.250.8/29}
+  monitor-egress:
+    name: vpn_endpoint_monitor_egress
+    internal: false
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: vpnmon-egress0
+    labels:
+      com.plantas-vpn-bastion.monitor-egress-policy: deny-private-linklocal-cgnat-reserved
+    ipam:
+      config:
+        - subnet: ${VPN_ENDPOINT_MONITOR_EGRESS_SUBNET:-172.30.250.0/29}
 
 volumes:
   caddy_data:

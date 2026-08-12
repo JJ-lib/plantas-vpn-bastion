@@ -1,0 +1,53 @@
+flush table inet vpn_endpoint_monitor
+
+add set inet vpn_endpoint_monitor denied_v4 {
+    type ipv4_addr
+    flags interval
+    elements = {
+        0.0.0.0/8,
+        10.0.0.0/8,
+        100.64.0.0/10,
+        127.0.0.0/8,
+        169.254.0.0/16,
+        172.16.0.0/12,
+        192.0.0.0/24,
+        192.0.2.0/24,
+        192.31.196.0/24,
+        192.52.193.0/24,
+        192.88.99.0/24,
+        192.168.0.0/16,
+        192.175.48.0/24,
+        198.18.0.0/15,
+        198.51.100.0/24,
+        203.0.113.0/24,
+        224.0.0.0/4,
+        240.0.0.0/4
+    }
+}
+
+add chain inet vpn_endpoint_monitor input {
+    type filter hook input priority -200
+    policy accept
+}
+
+add chain inet vpn_endpoint_monitor forward {
+    type filter hook forward priority -200
+    policy accept
+}
+
+add chain inet vpn_endpoint_monitor monitor_egress
+
+add rule inet vpn_endpoint_monitor input iifname { "vpnmon-api0", "vpnmon-egress0" } drop
+add rule inet vpn_endpoint_monitor forward oifname { "vpnmon-api0", "vpnmon-egress0" } ct state established,related accept
+add rule inet vpn_endpoint_monitor forward oifname "vpnmon-api0" iifname != "vpnmon-api0" drop
+add rule inet vpn_endpoint_monitor forward oifname "vpnmon-egress0" iifname != "vpnmon-egress0" drop
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname "vpnmon-api0" ip saddr 172.30.250.10 ip daddr 172.30.250.11 tcp dport 5000 accept
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname "vpnmon-api0" drop
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname != "vpnmon-api0" drop
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-egress0" jump monitor_egress
+add rule inet vpn_endpoint_monitor monitor_egress ct state invalid drop
+add rule inet vpn_endpoint_monitor monitor_egress ct state established,related accept
+add rule inet vpn_endpoint_monitor monitor_egress meta nfproto ipv6 drop
+add rule inet vpn_endpoint_monitor monitor_egress ip daddr @denied_v4 reject with icmpx type admin-prohibited
+add rule inet vpn_endpoint_monitor monitor_egress fib daddr type != unicast drop
+add rule inet vpn_endpoint_monitor monitor_egress accept

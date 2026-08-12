@@ -1,0 +1,15 @@
+[Unit]
+Description=Fail-closed host egress policy for the VPN endpoint monitor
+Before=docker.service
+PartOf=docker.service
+After=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft add table inet vpn_endpoint_monitor
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/vpn-endpoint-monitor.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/vpn-endpoint-monitor.nft
+
+[Install]
+RequiredBy=docker.service
