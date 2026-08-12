@@ -96,6 +96,7 @@ _HEALTH_COLUMNS = (
     "latency_ms",
 )
 _HEALTH_COLUMN_SQL = ",".join(_HEALTH_COLUMNS)
+_REQUIRED_HEALTH_COLUMNS = frozenset(_HEALTH_COLUMNS)
 
 
 class StaleRevisionError(ValueError):
@@ -414,7 +415,7 @@ def ensure_endpoint_health_schema(conn: sqlite3.Connection) -> None:
         row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vpn_endpoint_health'").fetchone()
         if row:
             columns = {item[1]: item[0] for item in conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
-            if "icmp_ok" not in columns or "updated_at" not in columns:
+            if not _REQUIRED_HEALTH_COLUMNS <= columns.keys():
                 _migrate_legacy_health(conn, columns)
             else:
                 _create_current_schema(conn)

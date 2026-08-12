@@ -2,6 +2,7 @@ import ast
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -94,6 +95,90 @@ class SchemaTests(HealthFixture):
     def test_sqlite_concurrency_pragmas_are_configured(self):
         configure_sqlite_connection(self.conn)
         self.assertEqual(self.conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+
+    def test_partial_existing_schema_is_migrated_atomically(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """CREATE TABLE vpn_endpoint_health(
+                vpn_id INTEGER PRIMARY KEY,
+                target_revision TEXT NOT NULL,
+                state TEXT NOT NULL,
+                consecutive_failures INTEGER NOT NULL,
+                icmp_ok INTEGER,
+                updated_at INTEGER NOT NULL
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO vpn_endpoint_health VALUES(?,?,?,?,?,?)",
+            (1, self.revision, "accessible", 2, 0, 1000),
+        )
+        ensure_endpoint_health_schema(conn)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(vpn_endpoint_health)")
+        }
+        self.assertTrue(
+            {
+                "target_generation", "cycle_id", "lease_id", "protocol_ok",
+                "protocol_probe", "icmp_code", "protocol_code", "last_checked_at",
+                "last_success_at", "last_transition_at", "latency_ms",
+            } <= columns
+        )
+        self.assertEqual(
+            tuple(conn.execute(
+                "SELECT state,consecutive_failures FROM vpn_endpoint_health WHERE vpn_id=1"
+            ).fetchone()),
+            ("accessible", 2),
+        )
+        conn.close()
+
+    def test_file_backed_wal_concurrent_schema_and_reopen_persist_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "panel.db")
+            errors = []
+
+            def initialize():
+                try:
+                    conn = sqlite3.connect(database, timeout=5)
+                    conn.row_factory = sqlite3.Row
+                    ensure_endpoint_health_schema(conn)
+                    conn.close()
+                except Exception as error:  # pragma: no cover - asserted below
+                    errors.append(error)
+
+            threads = [threading.Thread(target=initialize) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+
+            conn = sqlite3.connect(database, timeout=5)
+            conn.row_factory = sqlite3.Row
+            configure_sqlite_connection(conn)
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            revision = target_revision(TARGET)
+            for checked_at in (1000, 1060, 1120):
+                apply_probe_result(
+                    conn,
+                    self.result(checked_at=checked_at),
+                    expected_revision=revision,
+                )
+            conn.close()
+
+            reopened = sqlite3.connect(database, timeout=5)
+            reopened.row_factory = sqlite3.Row
+            configure_sqlite_connection(reopened)
+            health = health_for_vpns(reopened, [1], now=1120)[1]
+            self.assertEqual(health["state"], "unreachable")
+            self.assertEqual(health["consecutive_failures"], FAILURE_THRESHOLD)
+            self.assertEqual(
+                reopened.execute(
+                    "SELECT COUNT(*) FROM vpn_endpoint_health_events"
+                ).fetchone()[0],
+                1,
+            )
+            reopened.close()
 
 
 class StateMachineTests(HealthFixture):
