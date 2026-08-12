@@ -492,8 +492,27 @@ class ContractAndWorkerTests(unittest.TestCase):
         self.assertEqual(run_worker(Client(), once=True, sleep=calls.append), 1)
         self.assertEqual(calls, [[]])
         sleeps = []
-        self.assertEqual(run_worker(Client(), max_cycles=2, interval=60, sleep=sleeps.append, jitter=lambda _value: 0), 2)
-        self.assertEqual(sleeps, [60.0])
+
+        class Clock:
+            value = 100.0
+
+            def __call__(self):
+                return self.value
+
+        clock = Clock()
+
+        def timed_cycle(*_args, **_kwargs):
+            clock.value += 1.5
+            return 0
+
+        self.assertEqual(
+            run_worker(
+                Client(), max_cycles=2, interval=60, sleep=sleeps.append,
+                jitter=lambda _value: 0, monotonic=clock, cycle=timed_cycle,
+            ),
+            2,
+        )
+        self.assertEqual(sleeps, [58.5])
 
     def test_token_loader_rejects_unbounded_or_invalid_secret_files(self):
         with mock.patch("vpn_endpoint_monitor.Path") as path_type:

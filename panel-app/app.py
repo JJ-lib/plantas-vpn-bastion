@@ -165,7 +165,9 @@ def vpn_mutation_lock(fn):
   with vpn_slug_lock(row['slug']):return fn(i,*args,**kwargs)
  return wrapped
 def _inspect_exact(name,fmt):
- p=subprocess.run(['docker','inspect','--format',fmt,name],text=True,capture_output=True,timeout=15);return p.returncode,p.stdout.strip()
+ try:
+  p=subprocess.run(['docker','inspect','--format',fmt,name],text=True,capture_output=True,timeout=15);return p.returncode,p.stdout.strip()
+ except (FileNotFoundError,subprocess.TimeoutExpired):return 127,''
 def _remove_exact(name,expected_service=None,expected_slug=None,expected_image=None):
  rc,out=_inspect_exact(name,'{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "plantas.vpn.slug"}}|{{index .Config.Labels "plantas.vpn.onboarding"}}|{{.Image}}')
  if rc!=0:return
@@ -1243,7 +1245,9 @@ def vpn_new_kind(kind):
         flash('Borrador creado. La VPN se validará de forma aislada antes de activarse.');return redirect('/admin/vpns')
     except (ValueError,sqlite3.IntegrityError) as e:return page('Nueva VPN '+kind.upper(),vf(request.form,kind,str(e))),400
 def reset_inactive_vpn_draft(v):
-    sl=v['slug'];subprocess.run(['docker','rm','-f','vpn-'+sl],text=True,capture_output=True,timeout=60)
+    sl=v['slug']
+    try:subprocess.run(['docker','rm','-f','vpn-'+sl],text=True,capture_output=True,timeout=60)
+    except (FileNotFoundError,subprocess.TimeoutExpired):pass
     for path in (f'{BASE}/configs/{sl}',f'{BASE}/sites/{sl}'):
         if os.path.isdir(path):shutil.rmtree(path)
     db().execute("UPDATE vpns SET active=0,onboarding_state='draft',validation_stage='local',validation_code='pending',validation_detail='Pendiente de validación local.',next_retry_at=NULL,retry_count=0 WHERE id=?",(v['id'],));db().commit()
