@@ -1635,7 +1635,7 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
             backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** (failure_streak - 1)))
             try:
                 jitter_value = float(jitter(backoff))
-            except (TypeError, ValueError):
+            except (OverflowError, TypeError, ValueError):
                 jitter_value = 0.0
             if not math.isfinite(jitter_value):
                 jitter_value = 0.0

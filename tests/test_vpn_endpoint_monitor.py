@@ -630,6 +630,31 @@ class ContractAndWorkerTests(unittest.TestCase):
         self.assertEqual(sleeps, [63.0, 123.0, 55.0])
         self.assertEqual(jitter_inputs, [60.0, 120.0])
 
+    def test_worker_bounds_integer_jitter_that_overflows_float(self):
+        now = [0.0]
+        starts = []
+
+        def cycle(_client, **_kwargs):
+            starts.append(now[0])
+            now[0] += 5.0
+            if len(starts) == 1:
+                raise RuntimeError("synthetic API failure")
+            return 1
+
+        def sleep(delay):
+            self.assertTrue(math.isfinite(delay))
+            self.assertGreaterEqual(delay, 0.0)
+            now[0] += delay
+
+        self.assertEqual(
+            run_worker(
+                object(), max_cycles=2, interval=60, sleep=sleep,
+                jitter=lambda _value: 10 ** 10000, monotonic=lambda: now[0], cycle=cycle,
+            ),
+            2,
+        )
+        self.assertEqual(starts, [0.0, 65.0])
+
     def test_worker_bounds_nonfinite_and_extreme_injected_jitter(self):
         cases = (
             (float("nan"), 65.0),
