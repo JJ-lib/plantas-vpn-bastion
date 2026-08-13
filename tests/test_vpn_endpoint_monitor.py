@@ -1,4 +1,5 @@
 import json
+import math
 import socket
 import sys
 import unittest
@@ -492,8 +493,151 @@ class ContractAndWorkerTests(unittest.TestCase):
         self.assertEqual(run_worker(Client(), once=True, sleep=calls.append), 1)
         self.assertEqual(calls, [[]])
         sleeps = []
-        self.assertEqual(run_worker(Client(), max_cycles=2, interval=60, sleep=sleeps.append, jitter=lambda _value: 0), 2)
+        self.assertEqual(
+            run_worker(
+                Client(),
+                max_cycles=2,
+                interval=60,
+                sleep=sleeps.append,
+                jitter=lambda _value: 0,
+                monotonic=lambda: 0.0,
+            ),
+            2,
+        )
         self.assertEqual(sleeps, [60.0])
+
+    def test_worker_schedules_cycle_starts_at_exact_interval(self):
+        now = [0.0]
+        starts = []
+
+        def cycle(_client, **_kwargs):
+            starts.append(now[0])
+            now[0] += 7.0
+            return 1
+
+        def sleep(delay):
+            now[0] += delay
+
+        self.assertEqual(
+            run_worker(
+                object(),
+                max_cycles=3,
+                interval=60,
+                sleep=sleep,
+                jitter=lambda _value: 0,
+                monotonic=lambda: now[0],
+                cycle=cycle,
+            ),
+            3,
+        )
+        self.assertEqual(starts, [0.0, 60.0, 120.0])
+
+    def test_worker_reanchors_after_overrun_without_negative_sleep(self):
+        now = [0.0]
+        starts = []
+        sleeps = []
+        durations = iter((75.0, 0.0, 0.0))
+
+        def cycle(_client, **_kwargs):
+            starts.append(now[0])
+            now[0] += next(durations)
+            return 1
+
+        def sleep(delay):
+            self.assertGreaterEqual(delay, 0.0)
+            sleeps.append(delay)
+            now[0] += delay
+
+        self.assertEqual(
+            run_worker(
+                object(),
+                max_cycles=3,
+                interval=60,
+                sleep=sleep,
+                jitter=lambda _value: 0,
+                monotonic=lambda: now[0],
+                cycle=cycle,
+            ),
+            3,
+        )
+        self.assertEqual(starts, [0.0, 75.0, 135.0])
+        self.assertEqual(sleeps, [0.0, 60.0])
+
+    def test_worker_applies_jitter_only_to_failure_backoff(self):
+        now = [0.0]
+        starts = []
+        sleeps = []
+        jitter_inputs = []
+
+        def cycle(_client, **_kwargs):
+            starts.append(now[0])
+            now[0] += 5.0
+            if len(starts) <= 2:
+                raise RuntimeError("synthetic API failure")
+            return 1
+
+        def sleep(delay):
+            sleeps.append(delay)
+            now[0] += delay
+
+        def jitter(delay):
+            jitter_inputs.append(delay)
+            return 3.0
+
+        self.assertEqual(
+            run_worker(
+                object(),
+                max_cycles=4,
+                interval=60,
+                sleep=sleep,
+                jitter=jitter,
+                monotonic=lambda: now[0],
+                cycle=cycle,
+            ),
+            4,
+        )
+        self.assertEqual(starts, [0.0, 68.0, 196.0, 256.0])
+        self.assertEqual(sleeps, [63.0, 123.0, 55.0])
+        self.assertEqual(jitter_inputs, [60.0, 120.0])
+
+    def test_worker_bounds_nonfinite_and_extreme_injected_jitter(self):
+        cases = (
+            (float("nan"), 65.0),
+            (float("inf"), 65.0),
+            (float("-inf"), 65.0),
+            (1e308, 71.0),
+            (-1e308, 59.0),
+        )
+        for jitter_value, expected_second_start in cases:
+            with self.subTest(jitter_value=jitter_value):
+                now = [0.0]
+                starts = []
+
+                def cycle(_client, **_kwargs):
+                    starts.append(now[0])
+                    now[0] += 5.0
+                    if len(starts) == 1:
+                        raise RuntimeError("synthetic API failure")
+                    return 1
+
+                def sleep(delay):
+                    self.assertTrue(math.isfinite(delay))
+                    self.assertGreaterEqual(delay, 0.0)
+                    now[0] += delay
+
+                self.assertEqual(
+                    run_worker(
+                        object(),
+                        max_cycles=2,
+                        interval=60,
+                        sleep=sleep,
+                        jitter=lambda _value: jitter_value,
+                        monotonic=lambda: now[0],
+                        cycle=cycle,
+                    ),
+                    2,
+                )
+                self.assertEqual(starts, [0.0, expected_second_start])
 
     def test_token_loader_rejects_unbounded_or_invalid_secret_files(self):
         with mock.patch("vpn_endpoint_monitor.Path") as path_type:

@@ -1618,6 +1618,7 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
     completed = 0
     failure_streak = 0
     while True:
+        cycle_started_at = monotonic()
         try:
             cycle(client, workers=workers, probe=lambda target: probe_target(
                 target, limits=ProbeLimits(timeout_seconds=timeout)))
@@ -1629,15 +1630,23 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
         completed += 1
         if once or (max_cycles is not None and completed >= max_cycles):
             return completed
-        backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** max(0, failure_streak - 1)))
-        delay = min(MAX_BACKOFF_SECONDS, max(1.0, backoff + float(jitter(backoff))))
-        # Keep one monotonic sample for the deadline.  This accounts for the
-        # cycle duration without introducing sub-microsecond noise into the
-        # configured interval.
-        started_at = monotonic()
-        deadline = started_at + delay
-        delay = min(MAX_BACKOFF_SECONDS, max(1.0, deadline - started_at))
-        sleep(delay)
+        delay = interval
+        if failure_streak:
+            backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** (failure_streak - 1)))
+            try:
+                jitter_value = float(jitter(backoff))
+            except (TypeError, ValueError):
+                jitter_value = 0.0
+            if not math.isfinite(jitter_value):
+                jitter_value = 0.0
+            jitter_limit = min(30.0, backoff * 0.1)
+            jitter_value = min(max(jitter_value, -jitter_limit), jitter_limit)
+            delay = min(MAX_BACKOFF_SECONDS, max(1.0, backoff + jitter_value))
+            deadline = monotonic() + delay
+        else:
+            deadline = cycle_started_at + delay
+        remaining = deadline - monotonic()
+        sleep(min(MAX_BACKOFF_SECONDS, max(0.0, remaining)))
 
 
 def main(argv: list[str] | None = None) -> int:
