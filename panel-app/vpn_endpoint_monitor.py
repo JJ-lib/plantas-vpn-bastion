@@ -1430,6 +1430,7 @@ DEFAULT_WORKERS = 4
 MAX_WORKERS = 4
 MAX_HTTP_RESPONSE_BYTES = 512 * 1024
 MAX_HTTP_REQUEST_BYTES = 64 * 1024
+MAX_TARGETS_PER_CYCLE = 10_000
 MAX_BACKOFF_SECONDS = 600.0
 WORKER_HTTP_TIMEOUT_SECONDS = 3.0
 TARGET_IDS_ENV = "VPN_ENDPOINT_MONITOR_TARGET_IDS"
@@ -1523,6 +1524,8 @@ class PanelClient:
             if len(page) > MAX_MONITOR_BATCH:
                 raise ValueError("panel target count exceeds the size limit")
             targets.extend(page)
+            if len(targets) > MAX_TARGETS_PER_CYCLE:
+                raise ValueError("panel target count exceeds the cycle limit")
             next_after = payload.get("next_after_id")
             if next_after is None:
                 break
@@ -1587,16 +1590,36 @@ def select_targets(targets: Iterable[Mapping[str, Any]], target_ids: frozenset[i
     return [target for target in targets if target.get("vpn_id") in target_ids]
 
 
+def _result_batches(results: list[Mapping[str, Any]]) -> Iterable[list[Mapping[str, Any]]]:
+    """Split results by both endpoint count and serialized request size."""
+    batch: list[Mapping[str, Any]] = []
+    for result in results:
+        candidate = batch + [result]
+        payload = {"results": candidate}
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if batch and (len(candidate) > MAX_MONITOR_BATCH or len(encoded) > MAX_HTTP_REQUEST_BYTES):
+            yield batch
+            batch = []
+            candidate = [result]
+            encoded = json.dumps({"results": candidate}, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_HTTP_REQUEST_BYTES:
+            raise ValueError("panel result exceeds the size limit")
+        batch = candidate
+    if batch:
+        yield batch
+
+
 def run_cycle(client: PanelClient, *, probe: Callable[[Mapping[str, Any]], Mapping[str, Any]] = probe_target,
               workers: int = DEFAULT_WORKERS, target_ids: frozenset[int] | None = None) -> int:
-    """Fetch one bounded target snapshot, probe it, and submit normalized DTOs."""
+    """Fetch one bounded target snapshot, probe it, and submit bounded DTO batches."""
     targets = select_targets(client.fetch_targets(), target_ids)
     if isinstance(workers, bool) or not isinstance(workers, int):
         raise ValueError("workers must be an integer")
     worker_count = min(max(workers, 1), MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="vpn-monitor") as executor:
         results = list(executor.map(probe, targets))
-    client.post_results(results)
+    for batch in _result_batches(results):
+        client.post_results(batch)
     return len(results)
 
 

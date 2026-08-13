@@ -15,6 +15,7 @@ from vpn_endpoint_monitor import (  # noqa: E402
     DEFAULT_INTERVAL_SECONDS,
     MAX_HOST_LENGTH,
     MAX_HTTP_RESPONSE_BYTES,
+    MAX_HTTP_REQUEST_BYTES,
     MAX_LATENCY_MS,
     MAX_MONITOR_BATCH,
     MAX_PORT,
@@ -478,6 +479,54 @@ class ContractAndWorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_target_selector("bad")
 
+    def test_run_cycle_fragments_large_result_sets(self):
+        targets = [target(vpn_id=index + 1) for index in range(501)]
+        posted = []
+
+        test_case = self
+        class Client:
+            def fetch_targets(self):
+                return targets
+
+            def post_results(self, results):
+                test_case.assertLessEqual(len(results), MAX_MONITOR_BATCH)
+                posted.append(results)
+
+        def probe(item):
+            return {
+                "vpn_id": item["vpn_id"], "target_revision": REVISION, "icmp_ok": True,
+                "protocol_ok": False, "protocol_probe": "tcp", "checked_at": 1,
+            }
+
+        self.assertEqual(run_cycle(Client(), probe=probe, workers=1), 501)
+        self.assertEqual(sum(map(len, posted)), 501)
+        self.assertGreaterEqual(len(posted), 2)
+
+    def test_run_cycle_fragments_batches_by_http_size(self):
+        targets = [target(vpn_id=index + 1) for index in range(200)]
+        posted = []
+
+        test_case = self
+        class Client:
+            def fetch_targets(self):
+                return targets
+
+            def post_results(self, results):
+                encoded = json.dumps({"results": results}, separators=(",", ":")).encode()
+                test_case.assertLessEqual(len(encoded), MAX_HTTP_REQUEST_BYTES)
+                posted.append(results)
+
+        def probe(item):
+            return {
+                "vpn_id": item["vpn_id"], "target_revision": REVISION, "icmp_ok": True,
+                "protocol_ok": False, "protocol_probe": "tcp", "checked_at": 1,
+                "icmp_code": "x" * 300, "protocol_code": "y" * 300,
+            }
+
+        self.assertEqual(run_cycle(Client(), probe=probe, workers=1), 200)
+        self.assertEqual(sum(map(len, posted)), 200)
+        self.assertGreater(len(posted), 1)
+
     def test_worker_runs_immediately_with_official_interval_and_bounded_backoff(self):
         self.assertEqual(DEFAULT_INTERVAL_SECONDS, 60.0)
         self.assertEqual(MAX_WORKERS, 4)
@@ -491,7 +540,7 @@ class ContractAndWorkerTests(unittest.TestCase):
                 calls.append(results)
 
         self.assertEqual(run_worker(Client(), once=True, sleep=calls.append), 1)
-        self.assertEqual(calls, [[]])
+        self.assertEqual(calls, [])
         sleeps = []
         self.assertEqual(
             run_worker(
