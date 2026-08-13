@@ -13,6 +13,7 @@ rule_target="/etc/nftables.d/vpn-endpoint-monitor.nft"
 unit_target="/etc/systemd/system/vpn-endpoint-monitor-egress.service"
 
 nft list table inet vpn_endpoint_monitor >/dev/null 2>&1 || nft add table inet vpn_endpoint_monitor
+nft list table bridge vpn_endpoint_monitor_l2 >/dev/null 2>&1 || nft add table bridge vpn_endpoint_monitor_l2
 nft -c -f "$rule_source"
 
 install -d -o root -g root -m 0755 /etc/nftables.d

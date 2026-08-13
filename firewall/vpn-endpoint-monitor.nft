@@ -1,4 +1,5 @@
 flush table inet vpn_endpoint_monitor
+flush table bridge vpn_endpoint_monitor_l2
 
 add set inet vpn_endpoint_monitor denied_v4 {
     type ipv4_addr
@@ -26,28 +27,40 @@ add set inet vpn_endpoint_monitor denied_v4 {
 }
 
 add chain inet vpn_endpoint_monitor input {
-    type filter hook input priority -200
+    type filter hook input priority -150
     policy accept
 }
 
 add chain inet vpn_endpoint_monitor forward {
-    type filter hook forward priority -200
+    type filter hook forward priority -150
     policy accept
 }
 
 add chain inet vpn_endpoint_monitor monitor_egress
 
-add rule inet vpn_endpoint_monitor input iifname { "vpnmon-api0", "vpnmon-egress0" } drop
-add rule inet vpn_endpoint_monitor forward oifname { "vpnmon-api0", "vpnmon-egress0" } ct state established,related accept
-add rule inet vpn_endpoint_monitor forward oifname "vpnmon-api0" iifname != "vpnmon-api0" drop
-add rule inet vpn_endpoint_monitor forward oifname "vpnmon-egress0" iifname != "vpnmon-egress0" drop
-add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname "vpnmon-api0" ip saddr 172.30.250.10 ip daddr 172.30.250.11 tcp dport 5000 accept
-add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname "vpnmon-api0" drop
-add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname != "vpnmon-api0" drop
+add rule inet vpn_endpoint_monitor input iifname { "vpnmon-api0", "vpnmon-egress0" } counter drop
+add rule inet vpn_endpoint_monitor forward oifname { "vpnmon-api0", "vpnmon-egress0" } ct state established,related counter accept
+add rule inet vpn_endpoint_monitor forward oifname "vpnmon-api0" iifname != "vpnmon-api0" counter drop
+add rule inet vpn_endpoint_monitor forward oifname "vpnmon-egress0" iifname != "vpnmon-egress0" counter drop
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname "vpnmon-api0" ip saddr 172.30.250.10 ip daddr 172.30.250.11 tcp dport 5000 counter accept
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname "vpnmon-api0" counter drop
+add rule inet vpn_endpoint_monitor forward iifname "vpnmon-api0" oifname != "vpnmon-api0" counter drop
 add rule inet vpn_endpoint_monitor forward iifname "vpnmon-egress0" jump monitor_egress
-add rule inet vpn_endpoint_monitor monitor_egress ct state invalid drop
-add rule inet vpn_endpoint_monitor monitor_egress ct state established,related accept
-add rule inet vpn_endpoint_monitor monitor_egress meta nfproto ipv6 drop
-add rule inet vpn_endpoint_monitor monitor_egress ip daddr @denied_v4 reject with icmpx type admin-prohibited
-add rule inet vpn_endpoint_monitor monitor_egress fib daddr type != unicast drop
-add rule inet vpn_endpoint_monitor monitor_egress accept
+add rule inet vpn_endpoint_monitor monitor_egress ct state invalid counter drop
+add rule inet vpn_endpoint_monitor monitor_egress ct state established,related counter accept
+add rule inet vpn_endpoint_monitor monitor_egress meta nfproto ipv6 counter drop
+add rule inet vpn_endpoint_monitor monitor_egress ip saddr != 172.30.250.2 counter drop
+add rule inet vpn_endpoint_monitor monitor_egress ip daddr @denied_v4 counter reject with icmpx type admin-prohibited
+add rule inet vpn_endpoint_monitor monitor_egress fib daddr type != unicast counter drop
+add rule inet vpn_endpoint_monitor monitor_egress counter accept
+
+add chain bridge vpn_endpoint_monitor_l2 forward {
+    type filter hook forward priority -200
+    policy accept
+}
+
+add rule bridge vpn_endpoint_monitor_l2 forward meta ibrname "vpnmon-api0" meta obrname "vpnmon-api0" ether type arp counter accept
+add rule bridge vpn_endpoint_monitor_l2 forward meta ibrname "vpnmon-api0" meta obrname "vpnmon-api0" ether type ip ip saddr 172.30.250.10 ip daddr 172.30.250.11 tcp dport 5000 counter accept
+add rule bridge vpn_endpoint_monitor_l2 forward meta ibrname "vpnmon-api0" meta obrname "vpnmon-api0" ether type ip ip saddr 172.30.250.11 ip daddr 172.30.250.10 tcp sport 5000 counter accept
+add rule bridge vpn_endpoint_monitor_l2 forward meta ibrname "vpnmon-api0" counter drop
+add rule bridge vpn_endpoint_monitor_l2 forward meta obrname "vpnmon-api0" counter drop

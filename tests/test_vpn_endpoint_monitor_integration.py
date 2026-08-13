@@ -157,25 +157,55 @@ class ComposeCaddyEnvironmentIntegrationTests(unittest.TestCase):
         firewall = (ROOT / "firewall" / "vpn-endpoint-monitor.nft").read_text(encoding="utf-8")
         service = (ROOT / "systemd" / "vpn-endpoint-monitor-egress.service").read_text(encoding="utf-8")
         self.assertIn('iifname "vpnmon-egress0" jump monitor_egress', firewall)
-        self.assertIn('iifname "vpnmon-api0" oifname != "vpnmon-api0" drop', firewall)
-        established = firewall.index(
-            'oifname { "vpnmon-api0", "vpnmon-egress0" } ct state established,related accept'
+        self.assertIn("type filter hook forward priority -150", firewall)
+        self.assertIn("ip saddr != 172.30.250.2", firewall)
+        self.assertRegex(
+            firewall,
+            r'iifname "vpnmon-api0" oifname != "vpnmon-api0"(?: counter)? drop',
         )
-        inbound_drop = firewall.index('oifname "vpnmon-egress0" iifname != "vpnmon-egress0" drop')
-        self.assertLess(established, inbound_drop)
-        self.assertIn('oifname "vpnmon-api0" iifname != "vpnmon-api0" drop', firewall)
-        self.assertIn('oifname "vpnmon-egress0" iifname != "vpnmon-egress0" drop', firewall)
-        self.assertIn('iifname { "vpnmon-api0", "vpnmon-egress0" } drop', firewall)
-        self.assertIn(
-            'ip saddr 172.30.250.10 ip daddr 172.30.250.11 tcp dport 5000 accept',
+        established = re.search(
+            r'oifname \{ "vpnmon-api0", "vpnmon-egress0" \} '
+            r'ct state established,related(?: counter)? accept',
             firewall,
         )
-        self.assertIn("ct state established,related accept", firewall)
+        inbound_drop = re.search(
+            r'oifname "vpnmon-egress0" iifname != "vpnmon-egress0"(?: counter)? drop',
+            firewall,
+        )
+        self.assertIsNotNone(established)
+        self.assertIsNotNone(inbound_drop)
+        self.assertLess(established.start(), inbound_drop.start())
+        self.assertRegex(
+            firewall,
+            r'oifname "vpnmon-api0" iifname != "vpnmon-api0"(?: counter)? drop',
+        )
+        self.assertRegex(
+            firewall,
+            r'oifname "vpnmon-egress0" iifname != "vpnmon-egress0"(?: counter)? drop',
+        )
+        self.assertRegex(
+            firewall,
+            r'iifname \{ "vpnmon-api0", "vpnmon-egress0" \}(?: counter)? drop',
+        )
+        self.assertRegex(
+            firewall,
+            r'ip saddr 172\.30\.250\.10 ip daddr 172\.30\.250\.11 '
+            r'tcp dport 5000(?: counter)? accept',
+        )
+        self.assertRegex(
+            firewall,
+            r"ct state established,related(?: counter)? accept",
+        )
         self.assertIn("Before=docker.service", service)
         self.assertIn("ExecStart=/usr/sbin/nft -f /etc/nftables.d/vpn-endpoint-monitor.nft", service)
         self.assertIn("RequiredBy=docker.service", service)
-        self.assertIn("PartOf=docker.service", service)
+        self.assertIn("PartOf=nftables.service docker.service", service)
         self.assertIn("After=nftables.service", service)
+        self.assertIn("add table bridge vpn_endpoint_monitor_l2", service)
+        self.assertIn('meta ibrname "vpnmon-api0"', firewall)
+        self.assertIn('meta obrname "vpnmon-api0"', firewall)
+        self.assertIn("tcp sport 5000", firewall)
+        self.assertNotIn('meta ibrname "vpnmon-egress0" counter drop', firewall)
 
 
 if __name__ == "__main__":
