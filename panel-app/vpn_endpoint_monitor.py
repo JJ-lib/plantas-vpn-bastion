@@ -1646,7 +1646,12 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
         else:
             deadline = cycle_started_at + delay
         remaining = deadline - monotonic()
-        sleep(min(MAX_BACKOFF_SECONDS, max(0.0, remaining)))
+        # A completed cycle may overrun its scheduled interval. Re-anchor from
+        # that completed cycle, but always yield before the next one so
+        # persistent overruns cannot form a zero-sleep retry loop.
+        if remaining <= 0.0:
+            remaining = min(1.0, interval)
+        sleep(min(MAX_BACKOFF_SECONDS, remaining))
 
 
 def main(argv: list[str] | None = None) -> int:

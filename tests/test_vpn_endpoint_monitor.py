@@ -560,8 +560,38 @@ class ContractAndWorkerTests(unittest.TestCase):
             ),
             3,
         )
-        self.assertEqual(starts, [0.0, 75.0, 135.0])
-        self.assertEqual(sleeps, [0.0, 60.0])
+        self.assertEqual(starts, [0.0, 76.0, 136.0])
+        self.assertEqual(sleeps, [1.0, 60.0])
+
+    def test_worker_persistent_overruns_always_yield(self):
+        now = [0.0]
+        starts = []
+        sleeps = []
+
+        def cycle(_client, **_kwargs):
+            starts.append(now[0])
+            now[0] += 75.0
+            return 1
+
+        def sleep(delay):
+            self.assertGreater(delay, 0.0)
+            sleeps.append(delay)
+            now[0] += delay
+
+        self.assertEqual(
+            run_worker(
+                object(),
+                max_cycles=3,
+                interval=60,
+                sleep=sleep,
+                jitter=lambda _value: 0,
+                monotonic=lambda: now[0],
+                cycle=cycle,
+            ),
+            3,
+        )
+        self.assertEqual(starts, [0.0, 76.0, 152.0])
+        self.assertEqual(sleeps, [1.0, 1.0])
 
     def test_worker_applies_jitter_only_to_failure_backoff(self):
         now = [0.0]
