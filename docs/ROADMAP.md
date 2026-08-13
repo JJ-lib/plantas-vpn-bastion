@@ -19,7 +19,7 @@ The roadmap is capability-based. Dates are omitted until the project has a publi
 - [x] SQLite WAL persistence, three-failure transition threshold, one-success recovery, transition events, and five-hour history.
 - [x] Admin diagnostics and public alerts with tunnel/endpoint separation and no endpoint details exposed to ordinary users.
 - [x] Non-root read-only monitor with only `CAP_NET_RAW`, no Docker/SQLite/VPN credentials, dedicated networks, and persistent fail-closed nftables policy.
-- [x] Canary production acceptance with immutable images, scoped promotion/rollback, real probes, host reboot, firewall-before-Docker ordering, and post-boot recovery.
+- [x] Canary and full-target production acceptance with immutable images, scoped promotion/rollback, real probes, host reboot, firewall-before-Docker ordering, post-boot recovery, and bounded pagination/result batches.
 
 ## Priorities
 
