@@ -7,6 +7,7 @@ from pathlib import Path
 from vpn_onboarding import ensure_onboarding_schema,set_validation_state
 from vpn_validation import ValidationResult,classify_evidence,collect_runtime_evidence,run_static_validation
 from vpn_runtime import runtime_image
+from plant_paths import plant_artifact_dir
 @dataclass(frozen=True)
 class Dependencies:
  generate:object
@@ -18,7 +19,7 @@ class Dependencies:
  seal_certificate:object=None
  unseal_certificate:object=None
 def start_spec(base,slug):
- base=Path(base).resolve();return ['docker','compose','--project-directory',str(base),'-f',str(base/'docker-compose.yml'),'-f',str(base/f'sites/{slug}/compose.yml'),'up','-d','--no-deps','--pull','never','--no-build','vpn-'+slug]
+ base=Path(base).resolve();return ['docker','compose','--project-directory',str(base),'-f',str(base/'docker-compose.yml'),'-f',str(plant_artifact_dir(base,slug)/'compose.yml'),'up','-d','--no-deps','--pull','never','--no-build','vpn-'+slug]
 def extract_certificate_digests(logs):
  return {m.lower() for m in re.findall(r'(?i)(?:--trusted-cert\s+|trusted-cert\s*=\s*)([a-f0-9]{64})(?![a-f0-9])',str(logs or ''))}
 def subprocess_runner(argv,timeout=30):
@@ -27,7 +28,7 @@ def subprocess_runner(argv,timeout=30):
  except subprocess.TimeoutExpired:return 124,''
 WEBFIX_SLUG_RE=re.compile(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?')
 def _webfix_compose_prefix(base,slug):
- base=Path(base).resolve();return ['docker','compose','--project-directory',str(base),'-f',str(base/'docker-compose.yml'),'-f',str(base/f'sites/{slug}/compose.yml')]
+ base=Path(base).resolve();return ['docker','compose','--project-directory',str(base),'-f',str(base/'docker-compose.yml'),'-f',str(plant_artifact_dir(base,slug)/'compose.yml')]
 def webfix_repair_spec(base,slug):
  if not WEBFIX_SLUG_RE.fullmatch(str(slug or '')):raise ValueError('Slug webfix no válido.')
  return [*_webfix_compose_prefix(base,slug),'up','-d','--no-deps','--force-recreate','--pull','never','--no-build','webfix-'+slug]
@@ -150,14 +151,14 @@ def default_generate(vpn,base):
  import app as panel
  old=panel.BASE;panel.BASE=str(base);sl=vpn['slug']
  try:
-  os.makedirs(Path(base)/f'configs/{sl}',exist_ok=False);os.makedirs(Path(base)/f'sites/{sl}',exist_ok=False);owner=str(vpn.get('generation_owner') or '')
-  for d in (Path(base)/f'configs/{sl}',Path(base)/f'sites/{sl}'):(d/'.onboarding-owner').write_text(owner);os.chmod(d/'.onboarding-owner',0o600)
+  pd=plant_artifact_dir(base,sl);os.makedirs(Path(base)/f'configs/{sl}',exist_ok=False);pd.parent.mkdir(parents=True,exist_ok=True);pd.mkdir(exist_ok=False);owner=str(vpn.get('generation_owner') or '')
+  for d in (Path(base)/f'configs/{sl}',pd):(d/'.onboarding-owner').write_text(owner);os.chmod(d/'.onboarding-owner',0o600)
   with panel.app.app_context():panel.ensure_haproxy(sl,vpn['plant'])
   kind=vpn['vpn_type'] or 'ssl'
   if kind=='ipsec':panel.gen_ipsec(vpn,sl)
   elif kind in {'pptp','openvpn'}:panel.gen_access_vpn(vpn,sl)
   else:panel.gen_ssl(vpn,sl)
-  compose=Path(base)/f'sites/{sl}/compose.yml';text=compose.read_text();needle='      plantas.vpn.onboarding: "true"\n'
+  compose=pd/'compose.yml';text=compose.read_text();needle='      plantas.vpn.onboarding: "true"\n'
   if needle not in text:raise RuntimeError('El Compose generado no tiene label de onboarding.')
   text=text.replace(needle,needle+f'      plantas.vpn.owner: "{owner}"\n      plantas.vpn.revision: "{int(vpn.get("onboarding_revision") or 0)}"\n',1);compose.write_text(text)
  finally:panel.BASE=old
@@ -170,11 +171,11 @@ def default_activate(conn,vpn,base,runner):
  if len(parts)<7 or parts[2]!=vpn['slug'] or parts[3]!=_expected(vpn) or parts[4]!=str(vpn.get('generation_owner') or '') or parts[5]!=str(int(vpn.get('onboarding_revision') or 0)) or parts[6].lower()!='true':return _blocked('activation_runtime_changed','El runtime cambió de owner/revisión/imagen antes de la activación.')
  rc,ports=runner(['docker','inspect','--format','{{json .HostConfig.PortBindings}}',f"vpn-{vpn['slug']}"],timeout=20)
  if rc!=0 or ports.strip() not in {'null','{}',''}:return _blocked('activation_ports_present','El runtime de borrador expone puertos antes de activarse.')
- rc,_=runner(['docker','compose','--project-directory',str(base),'-f',str(Path(base)/'docker-compose.yml'),'-f',str(Path(base)/f"sites/{vpn['slug']}/compose.yml"),'config','-q'],timeout=60)
+ rc,_=runner(['docker','compose','--project-directory',str(base),'-f',str(Path(base)/'docker-compose.yml'),'-f',str(plant_artifact_dir(base,vpn['slug'])/'compose.yml'),'config','-q'],timeout=60)
  if rc!=0:return _blocked('activation_compose_invalid','El Compose publicado dejó de ser válido.')
  return ValidationResult('active','activation','active','VPN validada y activada sin recrear el runtime.',False)
 def default_cleanup(vpn,base,runner):
- sl=vpn['slug'];owner=str(vpn.get('generation_owner') or '');expected=str(vpn.get('runtime_image_ref') or '')
+ sl=vpn['slug'];pd=plant_artifact_dir(base,sl);owner=str(vpn.get('generation_owner') or '');expected=str(vpn.get('runtime_image_ref') or '')
  for name,service in ((f'webfix-{sl}',f'webfix-{sl}'),(f'vpn-{sl}',f'vpn-{sl}')):
   rc,out=runner(['docker','inspect','--format','{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "plantas.vpn.slug"}}|{{index .Config.Labels "plantas.vpn.onboarding"}}|{{.Image}}|{{index .Config.Labels "plantas.vpn.owner"}}|{{index .Config.Labels "plantas.vpn.revision"}}',name],timeout=20)
   if rc!=0:continue
@@ -183,7 +184,7 @@ def default_cleanup(vpn,base,runner):
   if name.startswith('vpn-') and owner and (slug_got!=sl or onboarding!='true' or owner_got!=owner or revision_got!=str(int(vpn.get('onboarding_revision') or 0)) or (expected and image!=expected)):raise RuntimeError('Ownership VPN no válido.')
   rc,_=runner(['docker','rm','-f',name],timeout=60)
   if rc!=0:raise RuntimeError('No se pudo eliminar el contenedor exacto.')
- for d in (Path(base)/f'configs/{sl}',Path(base)/f'sites/{sl}'):
+ for d in (Path(base)/f'configs/{sl}',pd):
   if d.exists():
    marker=d/'.onboarding-owner'
    if owner and (not marker.is_file() or marker.read_text()!=owner):raise RuntimeError('Artefactos ajenos al borrador.')
@@ -201,14 +202,14 @@ def _isolation_blocked(code,message):return ValidationResult('blocked','isolatio
 def _blocked(code,message):return ValidationResult('draft','local',code,message,False)
 def _manifest(base,slug):
  rows=[]
- for root in (Path(base)/f'configs/{slug}',Path(base)/f'sites/{slug}'):
+ for root in (Path(base)/f'configs/{slug}',plant_artifact_dir(base,slug)):
   if not root.is_dir():return ''
   for p in sorted(root.rglob('*')):
    if p.is_file() and p.name!='.onboarding-owner':rows.append(str(p.relative_to(base))+':'+hashlib.sha256(p.read_bytes()).hexdigest())
  return hashlib.sha256('\n'.join(rows).encode()).hexdigest() if rows else ''
 def _owned(base,slug,owner):
  if not owner:return False
- for d in (Path(base)/f'configs/{slug}',Path(base)/f'sites/{slug}'):
+ for d in (Path(base)/f'configs/{slug}',plant_artifact_dir(base,slug)):
   try:
    if (d/'.onboarding-owner').read_text()!=owner:return False
   except Exception:return False
@@ -265,7 +266,7 @@ def _handle_ssl_certificate(conn,vpn,base,now,deps,token,rev,result):
  except Exception:return ValidationResult('blocked','certificate','certificate_acceptance_failed','No se pudo fijar el certificado de forma aislada.',False),False
  return None,True
 def process_vpn(conn,vpn,base,now,deps,token,rev):
- vpn=dict(vpn);sl=vpn['slug'];cd=Path(base)/f'configs/{sl}';pd=Path(base)/f'sites/{sl}';initial=vpn.get('onboarding_state') or 'draft';owner=str(vpn.get('generation_owner') or '')
+ vpn=dict(vpn);sl=vpn['slug'];cd=Path(base)/f'configs/{sl}';pd=plant_artifact_dir(base,sl);initial=vpn.get('onboarding_state') or 'draft';owner=str(vpn.get('generation_owner') or '')
  if initial!='draft' and vpn.get('generation_phase')=='generating':
   partials=[d for d in (cd,pd) if d.exists()]
   owned_partial=bool(owner) and all((d/'.onboarding-owner').is_file() and (d/'.onboarding-owner').read_text()==owner for d in partials)
@@ -292,7 +293,7 @@ def process_vpn(conn,vpn,base,now,deps,token,rev):
    owner=secrets.token_urlsafe(24);_phase(conn,vpn['id'],'generating',token,rev,generation_owner=owner);vpn['generation_owner']=owner
    try:deps.generate(vpn,Path(base))
    except Exception:
-    shutil.rmtree(cd,ignore_errors=True);shutil.rmtree(pd,ignore_errors=True);_store(conn,vpn,_blocked('generation_failed','No se pudo generar la configuración VPN.'),now,token,rev);return
+    shutil.rmtree(cd,ignore_errors=True);shutil.rmtree(plant_artifact_dir(base,sl),ignore_errors=True);_store(conn,vpn,_blocked('generation_failed','No se pudo generar la configuración VPN.'),now,token,rev);return
   man=_manifest(base,sl)
   if not man:_store(conn,vpn,_blocked('generation_failed','Los artefactos generados están incompletos.'),now,token,rev);return
   _phase(conn,vpn['id'],'generated',token,rev,generated_manifest=man,runtime_image_ref=_expected(vpn));vpn['generated_manifest']=man

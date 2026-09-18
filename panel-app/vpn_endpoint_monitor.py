@@ -20,6 +20,7 @@ from pathlib import Path
 import random
 import re
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -55,25 +56,31 @@ DEFAULT_RETRIES = 1
 
 SUPPORTED_VPN_TYPES = frozenset({"ssl", "openvpn", "pptp", "ipsec"})
 SUPPORTED_TRANSPORTS = frozenset({"tcp", "udp"})
-SUPPORTED_PROBE_TYPES = frozenset({"tcp_connect", "ike", "openvpn_udp"})
+SUPPORTED_PROBE_TYPES = frozenset({"tcp", "ike", "openvpn_udp"})
 OUTCOMES = frozenset({"reachable", "unreachable", "inconclusive"})
-RESULT_FIELDS = (
-    "vpn_id",
-    "target_revision",
-    "target_generation",
-    "cycle_id",
-    "lease_id",
-    "probe_type",
-    "outcome",
-    "public_code",
-    "latency_ms",
-    "observed_at",
+RESULT_REQUIRED_FIELDS = frozenset(
+    {"vpn_id", "target_revision", "icmp_ok", "protocol_ok", "protocol_probe", "checked_at"}
 )
+RESULT_OPTIONAL_FIELDS = frozenset(
+    {
+        "icmp_code",
+        "protocol_code",
+        "latency_ms",
+        "target_generation",
+        "cycle_id",
+        "lease_id",
+    }
+)
+RESULT_FIELDS = RESULT_REQUIRED_FIELDS | RESULT_OPTIONAL_FIELDS
 
 _REVISION_RE = re.compile(r"[0-9a-f]{64}\Z")
 _HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _PUBLIC_CODES = frozenset(
     {
+        "icmp_reply",
+        "icmp_timeout",
+        "icmp_unreachable",
+        "icmp_probe_error",
         "tcp_accept",
         "tcp_unreachable",
         "ike_response",
@@ -231,10 +238,10 @@ def validate_target(target: Any) -> dict[str, Any]:
     revision = target.get("target_revision")
     if not isinstance(revision, str) or not _REVISION_RE.fullmatch(revision):
         raise ValueError("target_revision is invalid.")
-    target_generation = _strict_int(target.get("target_generation"), "target_generation", 0, MAX_TARGET_GENERATION)
-    cycle_id = _strict_int(target.get("cycle_id"), "cycle_id", 0, MAX_CYCLE_ID)
-    lease_id = target.get("lease_id")
-    if not isinstance(lease_id, str) or not 1 <= len(lease_id) <= MAX_LEASE_ID_LENGTH or not lease_id.isascii():
+    target_generation = _strict_int(target.get("target_generation", 0), "target_generation", 0, MAX_TARGET_GENERATION)
+    cycle_id = _strict_int(target.get("cycle_id", 0), "cycle_id", 0, MAX_CYCLE_ID)
+    lease_id = target.get("lease_id", "")
+    if not isinstance(lease_id, str) or len(lease_id) > MAX_LEASE_ID_LENGTH or not lease_id.isascii():
         raise ValueError("lease_id is invalid.")
 
     vpn_type = _bounded_text(target.get("vpn_type"), "vpn_type", 32).lower()
@@ -393,7 +400,7 @@ def _resolve_global_addresses(
     except socket.gaierror:
         raise _ResolutionProblem("dns_failed") from None
     except OSError:
-        raise _ResolutionProblem("dns_failure") from None
+        raise _ResolutionProblem("dns_failed") from None
     except Exception:
         raise _ResolutionProblem("dns_failure") from None
 
@@ -540,12 +547,12 @@ def _safe_probe_type(target: Any) -> str:
     if isinstance(target, Mapping):
         candidate = _probe_type_for(target)
         if candidate is not None:
-            return candidate
+            return {"tcp_connect": "tcp", "ike": "ike", "openvpn_udp": "openvpn_udp"}[candidate]
         if target.get("vpn_type") == "ipsec":
             return "ike"
         if target.get("transport") == "udp" and target.get("vpn_type") == "openvpn":
             return "openvpn_udp"
-    return "tcp_connect"
+    return "tcp"
 
 
 def _dto(
@@ -751,9 +758,10 @@ def build_ike_scan_argv(
         raise ValueError("ike-scan destination port is invalid.")
     argv = [
         "ike-scan",
-        f"--retry={limits.retries}",
-        f"--timeout={_format_timeout(limits.timeout_seconds * 1000)}",
-        f"--dport={destination_port}",
+        "--retry=" + str(limits.retries),
+        "--timeout=" + _format_timeout(limits.timeout_seconds * 1000),
+        "--sport=0",
+        "--dport=" + str(destination_port),
     ]
     if normalized["ike_version"] == "ikev2":
         argv.append("--ikev2")
@@ -833,7 +841,7 @@ def _run_ike(runner: Any, argv: list[str], timeout_seconds: float) -> tuple[int,
         shell=False,
         timeout=timeout_seconds,
         capture_output=True,
-        text=True,
+        text=False,
         check=False,
     )
     return _runner_fields(completed)
@@ -850,67 +858,32 @@ def probe_ike(
     clock: Any = None,
     limits: ProbeLimits | None = None,
 ) -> dict[str, Any]:
-    """Use an unprivileged UDP port probe in production; keep IKE scan injection for tests/admin tooling."""
+    """Run the pinned credential-free ike-scan adapter."""
 
     try:
         normalized = validate_target(target)
         active_limits = limits or ProbeLimits()
-        if runner is None:
-            return probe_udp_port(
-                normalized,
-                addresses=addresses,
-                resolver=resolver,
-                udp_socket_factory=udp_socket_factory,
-                socket_factory=socket_factory,
-                clock=clock,
-                limits=active_limits,
-                probe_type="ike",
-                response_code="udp_response",
-            )
         if _probe_type_for(normalized) != "ike":
-            return _dto(
-                normalized,
-                outcome="inconclusive",
-                public_code="unsupported_probe",
-                latency_ms=None,
-                clock=clock,
-                probe_type="ike",
-            )
+            return _dto(normalized, outcome="inconclusive", public_code="unsupported_probe", latency_ms=None, clock=clock, probe_type="ike")
         eligible = _eligible_supplied_addresses(addresses) if addresses is not None else _resolve_global_addresses(
-            normalized["host"],
-            normalized["port"],
-            resolver=resolver,
+            normalized["host"], normalized["port"], resolver=resolver,
             timeout_seconds=float(active_limits.timeout_seconds),
         )
         if not eligible:
             raise _ResolutionProblem("dns_no_global_address")
     except _ResolutionProblem as problem:
-        return _dto(
-            target,
-            outcome="inconclusive",
-            public_code=problem.public_code,
-            latency_ms=None,
-            clock=clock,
-            probe_type="ike",
-        )
+        return _dto(target, outcome="inconclusive", public_code=problem.public_code, latency_ms=None, clock=clock, probe_type="ike")
     except Exception:
-        return _dto(
-            target,
-            outcome="inconclusive",
-            public_code="probe_error",
-            latency_ms=None,
-            clock=clock,
-            probe_type="ike",
-        )
+        return _dto(target, outcome="inconclusive", public_code="probe_error", latency_ms=None, clock=clock, probe_type="ike")
 
     started = _clock_monotonic(clock)
+    runner = subprocess.run if runner is None else runner
     saw_tool_failure = False
-    saw_inconclusive = False
+    saw_silence = False
     for address in eligible:
-        scan_target = dict(normalized, host=address)
         try:
             argv_list = build_ike_scan_argvs(
-                scan_target,
+                dict(normalized, host=address),
                 timeout_seconds=float(active_limits.timeout_seconds),
                 retries=active_limits.retries,
             )
@@ -920,12 +893,12 @@ def probe_ike(
                     classification = classify_ike_scan_output(stdout, stderr, returncode=returncode)
                     if classification["public_code"] == "ike_response":
                         return _dto(normalized, outcome="reachable", public_code="ike_response", latency_ms=_bounded_latency_ms(clock, started, active_limits.max_latency_ms), clock=clock, probe_type="ike")
-                    if classification["outcome"] == "inconclusive":
-                        saw_inconclusive = True
-                    if classification["public_code"] == "probe_error":
+                    if classification["public_code"] == "ike_no_response":
+                        saw_silence = True
+                    else:
                         saw_tool_failure = True
                 except (subprocess.TimeoutExpired, TimeoutError, socket.timeout):
-                    saw_inconclusive = True
+                    saw_silence = True
                 except Exception:
                     saw_tool_failure = True
         except Exception:
@@ -933,18 +906,11 @@ def probe_ike(
 
     if saw_tool_failure:
         outcome, code = "inconclusive", "probe_error"
-    elif saw_inconclusive:
+    elif saw_silence:
         outcome, code = "inconclusive", "ike_no_response"
     else:
         outcome, code = "unreachable", "ike_unreachable"
-    return _dto(
-        normalized,
-        outcome=outcome,
-        public_code=code,
-        latency_ms=_bounded_latency_ms(clock, started, active_limits.max_latency_ms),
-        clock=clock,
-        probe_type="ike",
-    )
+    return _dto(normalized, outcome=outcome, public_code=code, latency_ms=_bounded_latency_ms(clock, started, active_limits.max_latency_ms), clock=clock, probe_type="ike")
 
 
 def _udp_factory_function(factory: Any) -> Callable[..., Any]:
@@ -1157,6 +1123,153 @@ def probe_openvpn_udp(
     )
 
 
+def _icmp_runner_function(runner: Any) -> Callable[..., Any]:
+    if runner is None:
+        return subprocess.run
+    if callable(runner):
+        return runner
+    candidate = getattr(runner, "run", None)
+    if callable(candidate):
+        return candidate
+    raise ValueError("icmp runner is not callable.")
+
+
+def probe_icmp(
+    addresses: Iterable[str],
+    *,
+    runner: Any = None,
+    clock: Any = None,
+    limits: ProbeLimits | None = None,
+) -> dict[str, Any]:
+    """Send exactly two bounded Echo Requests and keep only normalized evidence."""
+    active_limits = limits or ProbeLimits()
+    try:
+        eligible = _eligible_supplied_addresses(addresses)
+    except _ResolutionProblem as problem:
+        return {"icmp_ok": False, "icmp_code": problem.public_code, "latency_ms": None}
+    if not eligible:
+        return {"icmp_ok": False, "icmp_code": "dns_no_global_address", "latency_ms": None}
+
+    function = _icmp_runner_function(runner)
+    successes = 0
+    started = _clock_monotonic(clock)
+    for attempt in range(2):
+        address = eligible[attempt % len(eligible)]
+        try:
+            completed = function(
+                ["ping", "-n", "-c", "1", "-W", "1", address],
+                shell=False,
+                capture_output=True,
+                text=False,
+                timeout=min(1.0, float(active_limits.timeout_seconds)),
+                check=False,
+            )
+            returncode = completed.get("returncode") if isinstance(completed, Mapping) else getattr(completed, "returncode", 1)
+            if returncode == 0:
+                successes += 1
+        except (subprocess.TimeoutExpired, TimeoutError, socket.timeout):
+            continue
+        except (OSError, ValueError, TypeError):
+            continue
+    elapsed = _bounded_latency_ms(clock, started, active_limits.max_latency_ms)
+    if successes:
+        return {"icmp_ok": True, "icmp_code": "icmp_reply", "latency_ms": elapsed}
+    return {"icmp_ok": False, "icmp_code": "icmp_timeout", "latency_ms": elapsed}
+
+
+def _cycle_result(
+    target: Mapping[str, Any],
+    *,
+    icmp_ok: bool,
+    icmp_code: str,
+    protocol_ok: bool,
+    protocol_code: str,
+    protocol_probe: str,
+    latency_ms: int | None,
+    clock: Any,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "vpn_id": _safe_vpn_id(_raw_target_value(target, "vpn_id")),
+        "target_revision": _safe_revision(_raw_target_value(target, "target_revision")),
+        "icmp_ok": bool(icmp_ok),
+        "protocol_ok": bool(protocol_ok),
+        "protocol_probe": protocol_probe,
+        "checked_at": _safe_observed_at(clock),
+        "icmp_code": icmp_code if icmp_code in _PUBLIC_CODES or icmp_code.startswith("dns_") else "icmp_probe_error",
+        "protocol_code": protocol_code if protocol_code in _PUBLIC_CODES else "probe_error",
+        "latency_ms": latency_ms,
+    }
+    for name, maximum in (("target_generation", MAX_TARGET_GENERATION), ("cycle_id", MAX_CYCLE_ID)):
+        value = _raw_target_value(target, name, 0)
+        result[name] = value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= maximum else 0
+    lease = _raw_target_value(target, "lease_id", "")
+    result["lease_id"] = lease if isinstance(lease, str) and len(lease) <= MAX_LEASE_ID_LENGTH and lease.isascii() else ""
+    return result
+
+
+def probe_target(
+    target: Mapping[str, Any],
+    *,
+    resolver: Any = None,
+    icmp_runner: Any = None,
+    runner: Any = None,
+    tcp_connector: Any = None,
+    udp_socket_factory: Any = None,
+    socket_factory: Any = None,
+    clock: Any = None,
+    limits: ProbeLimits | None = None,
+) -> dict[str, Any]:
+    """Resolve once, run ICMP plus the protocol probe, and apply the OR rule."""
+    probe_type = _safe_probe_type(target)
+    try:
+        normalized = validate_target(target)
+        active_limits = limits or ProbeLimits()
+        raw_probe_type = _probe_type_for(normalized)
+        if raw_probe_type is None:
+            return _cycle_result(
+                normalized, icmp_ok=False, icmp_code="unsupported_probe", protocol_ok=False,
+                protocol_code="unsupported_probe", protocol_probe=probe_type,
+                latency_ms=None, clock=clock,
+            )
+        probe_type = {"tcp_connect": "tcp", "ike": "ike", "openvpn_udp": "openvpn_udp"}[raw_probe_type]
+        addresses = _resolve_global_addresses(
+            normalized["host"], normalized["port"], resolver=resolver,
+            timeout_seconds=float(active_limits.timeout_seconds),
+        )
+    except _ResolutionProblem as problem:
+        return _cycle_result(
+            target, icmp_ok=False, icmp_code=problem.public_code, protocol_ok=False,
+            protocol_code=problem.public_code, protocol_probe=probe_type,
+            latency_ms=None, clock=clock,
+        )
+    except Exception:
+        return _cycle_result(
+            target, icmp_ok=False, icmp_code="probe_error", protocol_ok=False,
+            protocol_code="probe_error", protocol_probe=probe_type,
+            latency_ms=None, clock=clock,
+        )
+
+    icmp = probe_icmp(addresses, runner=icmp_runner, clock=clock, limits=active_limits)
+    if probe_type == "tcp":
+        protocol = probe_tcp(normalized, addresses=addresses, tcp_connector=tcp_connector, socket_factory=socket_factory, clock=clock, limits=active_limits)
+    elif probe_type == "ike":
+        protocol = probe_ike(normalized, addresses=addresses, runner=runner, udp_socket_factory=udp_socket_factory, socket_factory=socket_factory, clock=clock, limits=active_limits)
+    elif probe_type == "openvpn_udp":
+        protocol = probe_openvpn_udp(normalized, addresses=addresses, udp_socket_factory=udp_socket_factory, socket_factory=socket_factory, clock=clock, limits=active_limits)
+    else:
+        protocol = {"outcome": "inconclusive", "public_code": "unsupported_probe", "latency_ms": None}
+    return _cycle_result(
+        normalized,
+        icmp_ok=bool(icmp["icmp_ok"]),
+        icmp_code=str(icmp["icmp_code"]),
+        protocol_ok=protocol.get("outcome") == "reachable",
+        protocol_code=str(protocol.get("public_code") or "probe_error"),
+        protocol_probe=probe_type,
+        latency_ms=protocol.get("latency_ms"),
+        clock=clock,
+    )
+
+
 def _limits_from_arguments(
     limits: ProbeLimits | None,
     timeout_seconds: float | None,
@@ -1261,6 +1374,8 @@ def dispatch_probe(
         )
 
 
+# The canonical public dispatcher returns the same exact result DTO as a cycle.
+dispatch_probe = probe_target
 # Small descriptive aliases for callers that prefer the protocol names.
 probe_udp = probe_openvpn_udp
 build_ike_scan_command = build_ike_scan_argv
@@ -1286,8 +1401,10 @@ __all__ = [
     "dispatch_probe",
     "dispatch",
     "is_global_unicast",
+    "probe_icmp",
     "probe_ike",
     "probe_openvpn_udp",
+    "probe_target",
     "probe_udp_port",
     "probe_tcp",
     "probe_udp",
@@ -1309,20 +1426,34 @@ __all__ = [
 
 # Task 4 worker loop.  This boundary deliberately uses only stdlib HTTP and
 # bounded in-memory state; failures are retried by the next cycle, never queued.
-DEFAULT_INTERVAL_SECONDS = 300.0
+DEFAULT_INTERVAL_SECONDS = 60.0
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 4
 MAX_HTTP_RESPONSE_BYTES = 512 * 1024
 MAX_HTTP_REQUEST_BYTES = 64 * 1024
+MAX_TARGETS_PER_CYCLE = 10_000
 MAX_BACKOFF_SECONDS = 600.0
 WORKER_HTTP_TIMEOUT_SECONDS = 3.0
 TARGET_IDS_ENV = "VPN_ENDPOINT_MONITOR_TARGET_IDS"
 
 
 def load_monitor_token(path: str | os.PathLike[str]) -> str:
-    """Read a deployment token without exposing it in logs or exceptions."""
+    """Read a token only from the worker-owned, non-link secret file."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        token = Path(path).read_bytes().decode("ascii").strip()
+        fd = os.open(os.fspath(path), flags)
+        try:
+            metadata = os.fstat(fd)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or metadata.st_gid != os.getgid() or mode & 0o377):
+                raise ValueError("monitor token permissions are invalid")
+            raw = os.read(fd, MAX_MONITOR_TOKEN_LENGTH + 2)
+        finally:
+            os.close(fd)
+        token = raw.decode("ascii").strip()
+    except ValueError:
+        raise
     except (OSError, UnicodeError):
         raise ValueError("monitor token is unavailable") from None
     if not MIN_MONITOR_TOKEN_LENGTH <= len(token) <= MAX_MONITOR_TOKEN_LENGTH or any(ord(char) < 33 or ord(char) > 126 for char in token):
@@ -1407,6 +1538,8 @@ class PanelClient:
             if len(page) > MAX_MONITOR_BATCH:
                 raise ValueError("panel target count exceeds the size limit")
             targets.extend(page)
+            if len(targets) > MAX_TARGETS_PER_CYCLE:
+                raise ValueError("panel target count exceeds the cycle limit")
             next_after = payload.get("next_after_id")
             if next_after is None:
                 break
@@ -1422,7 +1555,11 @@ class PanelClient:
         if not isinstance(results, list) or len(results) > MAX_MONITOR_BATCH:
             raise ValueError("panel result count exceeds the size limit")
         for result in results:
-            if not isinstance(result, Mapping) or set(result) != set(RESULT_FIELDS):
+            if (
+                not isinstance(result, Mapping)
+                or not RESULT_REQUIRED_FIELDS <= set(result)
+                or not set(result) <= RESULT_FIELDS
+            ):
                 raise ValueError("panel result schema is invalid")
         payload = self._request("POST", "/internal/vpn-endpoint-monitor/results", {"results": results})
         if not isinstance(payload, dict):
@@ -1467,16 +1604,36 @@ def select_targets(targets: Iterable[Mapping[str, Any]], target_ids: frozenset[i
     return [target for target in targets if target.get("vpn_id") in target_ids]
 
 
-def run_cycle(client: PanelClient, *, probe: Callable[[Mapping[str, Any]], Mapping[str, Any]] = dispatch_probe,
+def _result_batches(results: list[Mapping[str, Any]]) -> Iterable[list[Mapping[str, Any]]]:
+    """Split results by both endpoint count and serialized request size."""
+    batch: list[Mapping[str, Any]] = []
+    for result in results:
+        candidate = batch + [result]
+        payload = {"results": candidate}
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if batch and (len(candidate) > MAX_MONITOR_BATCH or len(encoded) > MAX_HTTP_REQUEST_BYTES):
+            yield batch
+            batch = []
+            candidate = [result]
+            encoded = json.dumps({"results": candidate}, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_HTTP_REQUEST_BYTES:
+            raise ValueError("panel result exceeds the size limit")
+        batch = candidate
+    if batch:
+        yield batch
+
+
+def run_cycle(client: PanelClient, *, probe: Callable[[Mapping[str, Any]], Mapping[str, Any]] = probe_target,
               workers: int = DEFAULT_WORKERS, target_ids: frozenset[int] | None = None) -> int:
-    """Fetch one bounded target snapshot, probe it, and submit normalized DTOs."""
+    """Fetch one bounded target snapshot, probe it, and submit bounded DTO batches."""
     targets = select_targets(client.fetch_targets(), target_ids)
     if isinstance(workers, bool) or not isinstance(workers, int):
         raise ValueError("workers must be an integer")
     worker_count = min(max(workers, 1), MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="vpn-monitor") as executor:
         results = list(executor.map(probe, targets))
-    client.post_results(results)
+    for batch in _result_batches(results):
+        client.post_results(batch)
     return len(results)
 
 
@@ -1498,8 +1655,9 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
     completed = 0
     failure_streak = 0
     while True:
+        cycle_started_at = monotonic()
         try:
-            cycle(client, workers=workers, probe=lambda target: dispatch_probe(
+            cycle(client, workers=workers, probe=lambda target: probe_target(
                 target, limits=ProbeLimits(timeout_seconds=timeout)))
         except Exception:
             # Deliberately no exception text: it may contain URL/token details.
@@ -1509,14 +1667,28 @@ def run_worker(client: PanelClient, *, once: bool = False, interval: float = DEF
         completed += 1
         if once or (max_cycles is not None and completed >= max_cycles):
             return completed
-        backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** max(0, failure_streak - 1)))
-        delay = min(MAX_BACKOFF_SECONDS, max(1.0, backoff + float(jitter(backoff))))
-        deadline = monotonic() + delay
-        # Account for cycle execution time so a slow cycle cannot create an
-        # unbounded scheduling drift.  The deadline is monotonic, never wall
-        # clock based, and the sleep remains bounded even after clock jumps.
-        delay = min(MAX_BACKOFF_SECONDS, max(1.0, deadline - monotonic()))
-        sleep(delay)
+        delay = interval
+        if failure_streak:
+            backoff = min(MAX_BACKOFF_SECONDS, interval * (2 ** (failure_streak - 1)))
+            try:
+                jitter_value = float(jitter(backoff))
+            except (OverflowError, TypeError, ValueError):
+                jitter_value = 0.0
+            if not math.isfinite(jitter_value):
+                jitter_value = 0.0
+            jitter_limit = min(30.0, backoff * 0.1)
+            jitter_value = min(max(jitter_value, -jitter_limit), jitter_limit)
+            delay = min(MAX_BACKOFF_SECONDS, max(1.0, backoff + jitter_value))
+            deadline = monotonic() + delay
+        else:
+            deadline = cycle_started_at + delay
+        remaining = deadline - monotonic()
+        # A completed cycle may overrun its scheduled interval. Re-anchor from
+        # that completed cycle, but always yield before the next one so
+        # persistent overruns cannot form a zero-sleep retry loop.
+        if remaining <= 0.0:
+            remaining = min(1.0, interval)
+        sleep(min(MAX_BACKOFF_SECONDS, remaining))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1534,10 +1706,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=DEFAULT_PROBE_TIMEOUT_SECONDS)
     parser.add_argument("--target-ids", default=os.environ.get(TARGET_IDS_ENV))
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args(argv)
     try:
         target_ids = parse_target_selector(args.target_ids)
-        client = PanelClient(args.panel_url, load_monitor_token(args.token_file))
+        token = load_monitor_token(args.token_file)
+        if args.healthcheck:
+            return 0
+        client = PanelClient(args.panel_url, token)
         run_worker(
             client,
             once=args.once,

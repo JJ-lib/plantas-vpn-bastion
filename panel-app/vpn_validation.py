@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import ipaddress,re,os
 from pathlib import Path
 from vpn_runtime import runtime_image,remote_subnets
+from plant_paths import plant_artifact_dir
 DEFAULT_VALIDATION_DENY_CIDRS=('127.0.0.0/8','169.254.0.0/16','100.64.0.0/10')
 def validation_deny_networks():
  raw=os.environ.get('VALIDATION_DENY_CIDRS',' '.join(DEFAULT_VALIDATION_DENY_CIDRS))
@@ -69,7 +70,7 @@ def target_probe_spec(slug,target_ip,target_port):
  return ['docker','exec','vpn-'+sl,'sh','-lc',f'timeout 5 bash -c "</dev/tcp/{ip}/{port}"']
 def static_validation_specs(vpn,base):
  base=Path(base).resolve();sl=_slug(vpn['slug']);kind=str(vpn['vpn_type']);engine=str(vpn.get('ipsec_engine') or 'libreswan') if hasattr(vpn,'get') else str(vpn['ipsec_engine'] or 'libreswan');image=runtime_image(kind,engine) if kind=='ipsec' else runtime_image(kind)
- specs=[['docker','compose','-f',str(base/'docker-compose.yml'),'-f',str(base/f'sites/{sl}/compose.yml'),'config'],['docker','image','inspect',image]];prefix=['docker','run','--rm','--pull','never','--network','none','--read-only','--tmpfs','/run','--tmpfs','/tmp','--entrypoint','sh'];cfg=base/f'configs/{sl}'
+ specs=[['docker','compose','-f',str(base/'docker-compose.yml'),'-f',str(plant_artifact_dir(base,sl)/'compose.yml'),'config'],['docker','image','inspect',image]];prefix=['docker','run','--rm','--pull','never','--network','none','--read-only','--tmpfs','/run','--tmpfs','/tmp','--entrypoint','sh'];cfg=base/f'configs/{sl}'
  if kind=='ssl':specs.append(prefix+['-v',str(cfg/'openfortivpn.conf')+':/etc/openfortivpn/config:ro',image,'-lc','timeout 8 openfortivpn -c /etc/openfortivpn/config'])
  elif kind=='openvpn':specs.append(prefix+['-v',str(cfg/'client.ovpn')+':/etc/openvpn/client.ovpn:ro',image,'-lc','openvpn --config /etc/openvpn/client.ovpn --show-gateway'])
  elif kind=='pptp':specs.append(prefix+['-v',str(cfg/'ppp-options')+':/etc/ppp/options.pptp:ro','-v',str(cfg/'chap-secrets')+':/etc/ppp/chap-secrets:ro',image,'-lc','test -s /etc/ppp/chap-secrets && pppd dryrun file /etc/ppp/options.pptp'])
@@ -90,7 +91,7 @@ def _validate_generated_files(vpn,base):
   if private and p.stat().st_mode&0o077:raise ValueError
   return p.read_text(encoding='utf-8')
  try:
-  compose=(base/'sites'/sl/'compose.yml').read_text(encoding='utf-8');engine=str(vpn.get('ipsec_engine') or 'libreswan');image=runtime_image(kind,engine) if kind=='ipsec' else runtime_image(kind)
+  compose=(plant_artifact_dir(base,sl)/'compose.yml').read_text(encoding='utf-8');engine=str(vpn.get('ipsec_engine') or 'libreswan');image=runtime_image(kind,engine) if kind=='ipsec' else runtime_image(kind)
   if 'container_name: vpn-'+sl not in compose or 'plantas.vpn.slug: "'+sl+'"' not in compose or 'image: '+image not in compose:return False
   if kind=='ssl':
    rows={}

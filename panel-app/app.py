@@ -2,15 +2,16 @@ import threading
 import fcntl,functools
 
 import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json, hmac, stat
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from datetime import datetime
 from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messages,Response,has_request_context,jsonify
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
-from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, public_alert_eligible, configure_sqlite_connection, StaleRevisionError, StaleCycleError, target_revision, validate_result
+from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, history_intervals, configure_sqlite_connection, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
+from plant_paths import plant_artifact_dir
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
 DB=os.environ.get('PANEL_DB',os.path.join(DATA_DIR,'panel.db')); BASE=os.environ.get('PROJECT_DIR','/opt/bastion-vpn')
 PUBLIC_ORIGIN=os.environ.get('BASTION_PUBLIC_ORIGIN','http://127.0.0.1').rstrip('/')
@@ -28,6 +29,16 @@ def k(path,gen):
 app=Flask(__name__); app.secret_key=k(os.path.join(DATA_DIR,'secret.key'),lambda:secrets.token_hex(32).encode()).decode(); F=Fernet(k(os.path.join(DATA_DIR,'fernet.key'),Fernet.generate_key))
 EQUIPMENT_TAG_CATALOG=('Scada','Trackers','Inversores','CCTV','SET')
 EQUIPMENT_TAG_SLUGS={'Scada':'scada','Trackers':'trackers','Inversores':'inversores','CCTV':'cctv','SET':'set'}
+WEB_MODES={'auto','direct','rewrite_cache','bridge_tls'}
+WEB_EFFECTIVE_MODES={'direct','rewrite_cache','bridge_tls'}
+BRIDGE_TLS_CERT='/etc/haproxy/certs/bridge.pem'
+BRIDGE_TLS_CIPHERS='DEFAULT@SECLEVEL=1'
+
+def normalize_web_bridge_host(value):
+    host=str(value or '').strip().lower().rstrip('.')
+    if len(host)>253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',host):
+        raise ValueError('El host canónico WEB para bridge TLS no es válido.')
+    return host
 
 VPN_TYPES={'ssl','ipsec','pptp','openvpn'}
 OPENVPN_MAX_BYTES=1024*1024
@@ -177,7 +188,7 @@ def _remove_exact(name,expected_service=None,expected_slug=None,expected_image=N
  if p.returncode!=0:raise RuntimeError('No se pudo eliminar el contenedor exacto.')
 def _owned_dirs(v):
  sl=v['slug'];owner=str(v['generation_owner'] or '') if 'generation_owner' in v.keys() else ''
- for d in (os.path.join(BASE,'configs',sl),os.path.join(BASE,'sites',sl)):
+ for d in (os.path.join(BASE,'configs',sl),plant_artifact_dir(BASE,sl)):
   if os.path.exists(d):
    marker=os.path.join(d,'.onboarding-owner')
    if not owner or not os.path.isfile(marker) or open(marker,encoding='utf-8').read()!=owner:raise RuntimeError('Artefactos ajenos al borrador.')
@@ -185,7 +196,7 @@ def prepare_draft_edit(i):
  v=db().execute('select * from vpns where id=?',(i,)).fetchone()
  if not v or int(v['active'] or 0):return
  _owned_dirs(v);_remove_exact('vpn-'+v['slug'],expected_slug=v['slug'],expected_image=(v['runtime_image_ref'] or None) if 'runtime_image_ref' in v.keys() else None)
- for d in (os.path.join(BASE,'configs',v['slug']),os.path.join(BASE,'sites',v['slug'])):
+ for d in (os.path.join(BASE,'configs',v['slug']),plant_artifact_dir(BASE,v['slug'])):
   if os.path.exists(d):shutil.rmtree(d)
  db().execute("update vpns set generation_phase='',generation_owner='',generated_manifest='',runtime_image_ref='' where id=?",(i,));db().commit()
 
@@ -311,7 +322,7 @@ def init():
         c.execute('UPDATE tags SET sort_order=? WHERE name=?',(sort_order,name))
     cols=[r[1] for r in c.execute('PRAGMA table_info(equipment)').fetchall()]
     if 'vpn_id' not in cols: c.execute('ALTER TABLE equipment ADD COLUMN vpn_id INTEGER')
-    for name,typ in {'proxy_port':'INTEGER','rdp_username_enc':'TEXT','rdp_password_enc':'TEXT','rdp_domain_enc':'TEXT','rdp_remote_app':'TEXT','vnc_password_enc':'TEXT','vnc_read_only':'INTEGER DEFAULT 0','web_mode':"TEXT DEFAULT 'auto'",'web_effective_mode':"TEXT DEFAULT 'direct'",'web_diagnostic':"TEXT DEFAULT ''",'web_proxy_port':'INTEGER'}.items():
+    for name,typ in {'proxy_port':'INTEGER','rdp_username_enc':'TEXT','rdp_password_enc':'TEXT','rdp_domain_enc':'TEXT','rdp_remote_app':'TEXT','vnc_password_enc':'TEXT','vnc_read_only':'INTEGER DEFAULT 0','web_mode':"TEXT DEFAULT 'auto'",'web_effective_mode':"TEXT DEFAULT 'direct'",'web_diagnostic':"TEXT DEFAULT ''",'web_proxy_port':'INTEGER','web_bridge_host':"TEXT DEFAULT ''"}.items():
         if name not in cols: c.execute(f'ALTER TABLE equipment ADD COLUMN {name} {typ}')
     vcols=[r[1] for r in c.execute('PRAGMA table_info(vpns)').fetchall()]
     extra_cols={
@@ -381,57 +392,70 @@ def admin(f):
         return f(*a,**kw)
     return w
 
-ENDPOINT_PUBLIC_ALERTS_ENV='VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED'
 ENDPOINT_MONITOR_COLLECTION_ENV='VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED'
 ENDPOINT_ADMIN_DIAGNOSTICS_ENV='VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED'
 def _feature_enabled(name):
     return os.environ.get(name,'false').strip().lower() in {'1','true','yes','on'}
-def endpoint_public_alerts_enabled():
-    return _feature_enabled(ENDPOINT_PUBLIC_ALERTS_ENV)
 def endpoint_monitor_collection_enabled():
     return _feature_enabled(ENDPOINT_MONITOR_COLLECTION_ENV)
 def endpoint_admin_diagnostics_enabled():
     return _feature_enabled(ENDPOINT_ADMIN_DIAGNOSTICS_ENV)
 
-ENDPOINT_STATE_LABELS={'healthy':'Saludable','suspect':'Primer fallo pendiente de confirmar','down':'Sin respuesta','unknown':'No concluyente','stale':'Comprobación obsoleta','disabled':'Monitorización desactivada'}
-ENDPOINT_CODE_LABELS={'tcp_accept':'Puerto TCP abierto','tcp_unreachable':'Puerto TCP no accesible','ike_response':'Respuesta IKE recibida','udp_response':'Puerto UDP responde','ike_no_response':'Puerto UDP sin respuesta (no concluyente)','ike_unreachable':'Puerto UDP no accesible','openvpn_udp_response':'Puerto UDP responde','udp_port_unreachable':'Puerto UDP cerrado','udp_silent':'Puerto UDP sin respuesta (no concluyente)','dns_failed':'No se pudo resolver la dirección pública','dns_failure':'No se pudo resolver la dirección pública','dns_timeout':'Tiempo de resolución agotado','dns_no_answers':'DNS sin respuestas','dns_no_global_address':'La dirección pública no es válida','private_or_reserved_destination':'Destino no público','probe_error':'No se pudo comprobar el puerto','unsupported_probe':'Tipo de VPN no compatible','not_checked':'Sin datos'}
+ENDPOINT_STATE_LABELS={'accessible':'Accesible','unreachable':'No accesible'}
+ENDPOINT_CODE_LABELS={'not_checked':'Sin datos','icmp_reply':'ICMP: OK','icmp_timeout':'ICMP: Fallo','icmp_unreachable':'ICMP: Fallo','icmp_probe_error':'ICMP: Error de sonda','tcp_accept':'TCP: OK','tcp_unreachable':'TCP: Fallo','ike_response':'IKE: OK','ike_no_response':'IKE: Sin respuesta (no concluyente)','ike_unreachable':'IKE: Fallo','openvpn_udp_response':'OpenVPN UDP: OK','udp_port_unreachable':'OpenVPN UDP: Puerto no accesible','udp_silent':'OpenVPN UDP: Sin respuesta (no concluyente)','dns_failed':'DNS: No se pudo resolver','dns_failure':'DNS: Error de resolución','dns_timeout':'DNS: Tiempo agotado','dns_no_answers':'DNS: Sin respuestas','dns_no_global_address':'Destino público no válido','private_or_reserved_destination':'Destino no público','probe_error':'No se pudo comprobar la sonda','unsupported_probe':'Tipo de VPN no compatible'}
 
 def endpoint_health_map(vpns):
     ids=[int(v['id']) for v in vpns if v is not None]
     return health_for_vpns(db(),ids) if ids else {}
 
-def endpoint_card_alert(health,online,admin_view=False):
-    if not health:return ''
-    if online:
-        if not endpoint_admin_diagnostics_enabled():return ''
-        return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>" if admin_view and health.get('state')=='down' else ''
-    if not public_alert_eligible(health):return ''
-    if not endpoint_public_alerts_enabled():return ''
-    return "<div class='endpoint-alert' role='status' aria-live='polite'><strong>El servidor público de la VPN no responde</strong><span>Se han confirmado dos fallos consecutivos.</span></div>"
+def _endpoint_time(value):
+    if value is None:
+        return 'Sin datos'
+    try:
+        return datetime.fromtimestamp(int(value)).strftime('%Y-%m-%d %H:%M:%S')
+    except (TypeError,ValueError,OSError,OverflowError):
+        return 'Sin datos'
+
+def _endpoint_evidence(value, ok_label='OK', fail_label='Fallo'):
+    if value is None:
+        return 'Sin datos'
+    return ok_label if bool(value) else fail_label
 
 def endpoint_health_admin_markup(health):
-    if not endpoint_admin_diagnostics_enabled():return ''
-    health=health or {'state':'unknown','consecutive_failures':0,'public_code':'not_checked','last_checked_at':None,'last_success_at':None,'latency_ms':None}
-    state=str(health.get('state') or 'unknown')
-    code_key=str(health.get('public_code') or 'not_checked')
-    label='Sin datos' if code_key=='not_checked' else ENDPOINT_STATE_LABELS.get(state,ENDPOINT_STATE_LABELS['unknown'])
-    code=ENDPOINT_CODE_LABELS.get(code_key,ENDPOINT_CODE_LABELS['probe_error'])
-    def local_time(value):
-        if value is None:return 'Sin datos'
-        try:return datetime.fromtimestamp(int(value)).strftime('%Y-%m-%d %H:%M:%S')
-        except (TypeError,ValueError,OSError,OverflowError):return 'Sin datos'
-    failures=max(0,int(health.get('consecutive_failures') or 0))
-    latency='Sin datos' if health.get('latency_ms') is None else f"{int(health['latency_ms'])} ms"
+    if not endpoint_admin_diagnostics_enabled():
+        return ''
+    health=health or {'state':'accessible','consecutive_failures':0,'last_checked_at':None,'last_success_at':None,'icmp_ok':None,'protocol_ok':None,'protocol_probe':None,'icmp_code':'not_checked','protocol_code':'not_checked','has_checked':False,'is_stale':False}
+    state=str(health.get('state') or 'accessible')
+    state_label='Sin datos' if not health.get('has_checked',health.get('last_checked_at') is not None) else ENDPOINT_STATE_LABELS.get(state,'Accesible')
+    probe=str(health.get('protocol_probe') or '—')
+    probe_label={'tcp':'TCP','ike':'IKE','openvpn_udp':'OpenVPN UDP'}.get(probe,probe)
+    code=ENDPOINT_CODE_LABELS.get(str(health.get('protocol_code') or 'not_checked'),'Sin datos')
+    if health.get('is_stale'):
+        code='Sin datos recientes'
     metrics=(
-        ('Fallos consecutivos',str(failures)),
-        ('Última comprobación',local_time(health.get('last_checked_at'))),
-        ('Último éxito',local_time(health.get('last_success_at'))),
-        ('Latencia',latency),
+        ('ICMP',_endpoint_evidence(health.get('icmp_ok'))),
+        (probe_label,_endpoint_evidence(health.get('protocol_ok'))),
+        ('Sonda',code),
+        ('Fallos consecutivos',str(max(0,int(health.get('consecutive_failures') or 0)))),
+        ('Última comprobación',_endpoint_time(health.get('last_checked_at'))),
+        ('Último éxito',_endpoint_time(health.get('last_success_at'))),
     )
     meta=''.join(f"<div><dt>{html.escape(name)}</dt><dd>{html.escape(value)}</dd></div>" for name,value in metrics)
     return (f"<div class='endpoint-health' data-endpoint-state='{html.escape(state,quote=True)}'>"
-            f"<div class='endpoint-health-title'><strong>{html.escape(label)}</strong><span class='endpoint-health-code'>{html.escape(code)}</span></div>"
+            f"<div class='endpoint-health-title'><strong>{html.escape(state_label)}</strong><span class='endpoint-health-code'>{html.escape(code)}</span></div>"
             f"<dl class='endpoint-health-meta'>{meta}</dl></div>")
+
+def endpoint_history_admin_markup(vpn_id):
+    if not endpoint_admin_diagnostics_enabled():
+        return ''
+    intervals=history_intervals(db(),int(vpn_id),now=int(time.time()),history_hours=5)
+    if not intervals:
+        return "<div class='endpoint-history'><p>Sin datos</p></div>"
+    segments=[]
+    for item in intervals:
+        state=item['state']; label=ENDPOINT_STATE_LABELS.get(state,'Accesible'); start=_endpoint_time(item['start_at']); end=_endpoint_time(item['end_at'])
+        segments.append(f"<span class='endpoint-history-segment endpoint-history-{html.escape(state,quote=True)}' title='{html.escape(start+' - '+end+' · '+label,quote=True)}' aria-label='{html.escape(start+' - '+end+' · '+label,quote=True)}'></span>")
+    return "<div class='endpoint-history' aria-label='Histórico de accesibilidad de las últimas 5 horas'>"+''.join(segments)+"</div>"
 
 MONITOR_TOKEN_FILE_ENV='VPN_ENDPOINT_MONITOR_TOKEN_FILE'
 MONITOR_DEFAULT_TOKEN_FILE='/run/secrets/vpn_endpoint_monitor_token'
@@ -513,7 +537,7 @@ def _monitor_target_from_row(row, *, cycle_id=0, lease_id='pending'):
 
 def _monitor_expected_probe(target):
     if target['vpn_type']=='ipsec':return 'ike'
-    return 'tcp_connect' if target['transport']=='tcp' else 'openvpn_udp'
+    return 'tcp' if target['transport']=='tcp' else 'openvpn_udp'
 
 def _monitor_json(raw):
     def pairs(items):
@@ -567,10 +591,14 @@ def monitor_results():
     except (UnicodeDecodeError,TypeError,ValueError,json.JSONDecodeError):return jsonify(ok=False,code='invalid_request'),400
     if not isinstance(payload,dict) or set(payload)!={'results'} or not isinstance(payload['results'],list) or len(payload['results'])>MONITOR_MAX_BATCH:
         return jsonify(ok=False,code='invalid_request'),400
-    normalized=[];seen=set()
+    normalized=[];seen=set();lease_fields={'target_generation','cycle_id','lease_id'}
     for item in payload['results']:
         try:row=validate_result(item)
         except (TypeError,ValueError):return jsonify(ok=False,code='invalid_result'),400
+        supplied_lease_fields=lease_fields & set(item)
+        if supplied_lease_fields and supplied_lease_fields != lease_fields:
+            return jsonify(ok=False,code='invalid_result'),400
+        row['_minimal_contract']=not supplied_lease_fields
         if row['vpn_id'] in seen:return jsonify(ok=False,code='duplicate_vpn_id'),400
         seen.add(row['vpn_id']);normalized.append(row)
     conn=db()
@@ -586,8 +614,15 @@ def monitor_results():
             vpn=by_id[row['vpn_id']]
             lease=conn.execute('SELECT * FROM vpn_endpoint_monitor_leases WHERE vpn_id=?',(row['vpn_id'],)).fetchone()
             generation=int(_row_value(vpn,'onboarding_revision',0) or 0)
-            if lease is None or row['target_generation']!=generation:
+            if lease is None:
                 conn.rollback();return jsonify(ok=False,code='stale_target_generation'),409
+            if row.get('_minimal_contract'):
+                row['target_generation']=generation
+                row['cycle_id']=int(lease['cycle_id'])
+                row['lease_id']=str(lease['lease_id'])
+            elif row['target_generation']!=generation:
+                conn.rollback();return jsonify(ok=False,code='stale_target_generation'),409
+            row.pop('_minimal_contract',None)
             if row['target_generation']!=int(lease['target_generation']) or row['cycle_id']!=int(lease['cycle_id']) or row['lease_id']!=lease['lease_id']:
                 conn.rollback();return jsonify(ok=False,code='invalid_monitor_lease'),409
             try:target=_monitor_target_from_row(vpn,cycle_id=row['cycle_id'],lease_id=row['lease_id'])
@@ -596,7 +631,7 @@ def monitor_results():
             targets[row['vpn_id']]=target
             if row['target_revision']!=target['target_revision']:
                 conn.rollback();return jsonify(ok=False,code='stale_target_revision'),409
-            if row['probe_type']!=_monitor_expected_probe(target):
+            if row['protocol_probe']!=_monitor_expected_probe(target):
                 conn.rollback();return jsonify(ok=False,code='probe_type_mismatch'),400
         for row in normalized:apply_probe_result(conn,row,expected_revision=targets[row['vpn_id']]['target_revision'],expected_generation=targets[row['vpn_id']]['target_generation'])
         conn.commit()
@@ -613,7 +648,7 @@ def monitor_results():
 S=r"""
 :root{--canvas:#f5f5f5;--paper:#fff;--surface:#fafafa;--ink:#0a0a0a;--ink-soft:#171717;--muted:#737373;--hairline:#e5e5e5;--success:#16a34a;--danger:#e7000b;--card-radius:24px;--control-radius:18px;--shadow:0 0 0 1px rgba(23,23,23,.05),0 1px 3px rgba(0,0,0,.10),0 1px 2px -1px rgba(0,0,0,.10)}
 [data-theme='dark']{--canvas:#0a0a0a;--paper:#171717;--surface:#111;--ink:#fafafa;--ink-soft:#e5e5e5;--muted:#a3a3a3;--hairline:#2f2f2f;--success:#4ade80;--danger:#ff4d55;--shadow:0 0 0 1px rgba(255,255,255,.08),0 1px 3px rgba(0,0,0,.45),0 1px 2px -1px rgba(0,0,0,.5)}
-*{box-sizing:border-box}[hidden]{display:none!important}html{background:var(--canvas);color-scheme:light}html[data-theme='dark']{color-scheme:dark}body{font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--canvas);color:var(--ink);margin:0;font-size:14px;line-height:1.43;font-feature-settings:"ss01" 1,"cv11" 1;transition:background .18s ease,color .18s ease}a{color:inherit}.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--surface) 92%,transparent);border-bottom:1px solid var(--hairline);backdrop-filter:blur(14px)}.topbar-inner{max-width:1280px;margin:auto;min-height:64px;padding:10px 24px;display:flex;align-items:center;gap:18px}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:600;letter-spacing:-.025em}.brand-mark{width:28px;height:28px;border-radius:9px;background:var(--ink);color:var(--paper);display:grid;place-items:center;font-size:11px}.nav{margin-left:auto;display:flex;align-items:center;gap:6px}.user-chip{color:var(--muted);padding:8px 10px}.wrap{max-width:1280px;margin:auto;padding:44px 24px 64px}.page-head{margin:0 0 28px}.eyebrow{margin:0 0 8px;color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.page-head h1{font-size:36px;line-height:1.11;letter-spacing:-.025em;margin:0;font-weight:600}.page-head p{max-width:680px;color:var(--muted);font-size:16px}.card{display:block;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:20px;margin:10px 0;color:var(--ink)}a.card{text-decoration:none;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}a.card:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--ink) 22%,var(--hairline))}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.plant-grid{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}.plant-card{min-height:210px;display:flex!important;flex-direction:column;justify-content:space-between}.plant-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.plant-card h2{font-size:24px;line-height:1.33;letter-spacing:-.025em;margin:0}.plant-count{font-size:36px;line-height:1.11;letter-spacing:-.025em;font-weight:600;margin:22px 0 2px}.plant-meta{color:var(--muted);margin:0}.plant-footer{display:flex;align-items:center;justify-content:space-between;margin-top:22px}.status{display:inline-flex;align-items:center;gap:7px;border-radius:18px;padding:4px 9px;font-size:12px;font-weight:500;background:var(--canvas)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--ink)}.status[data-vpn-status='online']{color:var(--success)}.status[data-vpn-status='online'] .status-dot{background:var(--success)}.status[data-vpn-status='offline']{color:var(--danger)}.status[data-vpn-status='offline'] .status-dot{background:var(--danger)}.arrow{font-size:18px}.btn{appearance:none;background:var(--canvas);color:var(--ink);border:0;border-radius:var(--control-radius);min-height:36px;padding:8px 13px;text-decoration:none;margin:3px;display:inline-flex;align-items:center;justify-content:center;gap:7px;font:500 14px/1 inherit;cursor:pointer}.btn:hover{background:var(--hairline)}.btn.primary{background:var(--ink);color:var(--paper)}.btn.primary:hover{background:var(--ink-soft)}.btn.outline{background:transparent;box-shadow:inset 0 0 0 1px var(--hairline)}.btn.danger{color:var(--danger);background:transparent}.page-head.has-action{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:18px}.page-head-title{min-width:0}.page-head-action{display:flex;align-items:center;justify-content:flex-end}.vpn-restart-control{display:flex;align-items:center;gap:10px}.vpn-restart-button{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-width:176px;min-height:44px;padding:0 18px;border:1px solid var(--ink);border-radius:var(--control-radius);background:transparent;color:var(--ink);font:600 13px/1 inherit;letter-spacing:.055em;text-transform:uppercase;position:relative;overflow:hidden;isolation:isolate;cursor:pointer;transition:color .35s,border-color .35s,opacity .2s}.vpn-restart-button span{position:relative;z-index:2}.vpn-restart-button::after{position:absolute;content:"";inset:0;width:0;height:100%;background:var(--danger);z-index:1;transition:width .35s}.vpn-restart-button:hover:not(:disabled){color:#fff;border-color:var(--danger)}.vpn-restart-button:hover:not(:disabled)::after,.vpn-restart-button.is-loading::after{width:100%}.vpn-restart-button.is-loading{color:#fff;border-color:var(--danger);cursor:wait}.vpn-restart-button:disabled{opacity:.72}.vpn-restart-button:focus-visible{outline:3px solid color-mix(in srgb,var(--danger) 34%,transparent);outline-offset:3px}.vpn-restart-feedback{max-width:220px;color:var(--muted);font-size:12px}.vpn-restart-feedback[data-state='success']{color:var(--success)}.vpn-restart-feedback[data-state='error']{color:var(--danger)}.theme-toggle{width:40px;padding:0;font-size:17px}.breadcrumb-row{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}.breadcrumb{display:flex;gap:7px;align-items:center;margin:0;color:var(--muted)}.back-button{margin:0;white-space:nowrap}.breadcrumb a{text-decoration:none}.breadcrumb-current{color:var(--ink)}.summary-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 24px}.badge{display:inline-flex;align-items:center;border-radius:18px;padding:3px 9px;font-size:12px;font-weight:500;background:var(--canvas);color:var(--ink-soft)}.badge.solid{background:var(--ink-soft);color:var(--paper)}.tag-scada{--tag-fg:#1d4ed8;--tag-bg:#eff6ff;--tag-border:#bfdbfe}.tag-trackers{--tag-fg:#b45309;--tag-bg:#fffbeb;--tag-border:#fde68a}.tag-inversores{--tag-fg:#15803d;--tag-bg:#f0fdf4;--tag-border:#bbf7d0}.tag-cctv{--tag-fg:#7e22ce;--tag-bg:#faf5ff;--tag-border:#e9d5ff}.tag-set{--tag-fg:#be123c;--tag-bg:#fff1f2;--tag-border:#fecdd3}[data-theme='dark'] .tag-scada{--tag-fg:#93c5fd;--tag-bg:#172554;--tag-border:#1e40af}[data-theme='dark'] .tag-trackers{--tag-fg:#fcd34d;--tag-bg:#451a03;--tag-border:#92400e}[data-theme='dark'] .tag-inversores{--tag-fg:#86efac;--tag-bg:#052e16;--tag-border:#166534}[data-theme='dark'] .tag-cctv{--tag-fg:#d8b4fe;--tag-bg:#3b0764;--tag-border:#7e22ce}[data-theme='dark'] .tag-set{--tag-fg:#fda4af;--tag-bg:#4c0519;--tag-border:#9f1239}.tag-badge{margin:2px 4px 2px 0;color:var(--tag-fg);background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-border)}.equipment-tags{min-width:150px}.tag-filter{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:14px 16px;margin:0 0 14px}.tag-filter-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.tag-filter-options{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.tag-filter-option{display:inline-flex;align-items:center;gap:6px;margin:0;padding:6px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:color-mix(in srgb,var(--tag-bg) 68%,var(--paper));color:var(--tag-fg);font-size:12px;font-weight:600;cursor:pointer;transition:background .15s ease,box-shadow .15s ease,transform .15s ease}.tag-filter-option:hover{background:var(--tag-bg);transform:translateY(-1px)}.tag-filter-option.is-active{background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-fg)}.tag-filter-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.tag-filter-clear{min-height:30px;padding:6px 10px;font-size:12px}.tag-filter-clear:disabled{opacity:.42;cursor:default}.tag-filter-empty{padding:26px;text-align:center}.tag-picker{border:1px solid var(--hairline);border-radius:var(--control-radius);padding:14px 16px;margin:16px 0}.tag-picker legend{font-weight:600;padding:0 6px}.tag-picker p{margin:0 0 8px}.tag-options{display:flex;flex-wrap:wrap;gap:8px}.tag-option{display:inline-flex;align-items:center;gap:7px;margin:0;padding:7px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:var(--tag-bg);color:var(--tag-fg);cursor:pointer}.tag-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.table-card{padding:0;overflow:hidden}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid var(--hairline);padding:14px 16px;text-align:left;vertical-align:middle}th{background:var(--surface);color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--canvas) 65%,transparent)}.sort-button{appearance:none;border:0;background:transparent;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit;padding:0;cursor:pointer;display:inline-flex;align-items:center;gap:6px}.sort-button::after{content:"↕";opacity:.45}.sort-button[data-direction='asc']::after{content:"↑";opacity:1}.sort-button[data-direction='desc']::after{content:"↓";opacity:1}.equipment-name{font-weight:600}.url{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:13px}.muted{color:var(--muted)}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}.vpn-form h3{margin-top:28px;border-bottom:1px solid var(--hairline);padding-bottom:9px}.error{border-color:var(--danger);color:var(--danger)}input,select,textarea{width:100%;padding:10px 12px;background:var(--canvas);color:var(--ink);border:1px solid transparent;border-radius:var(--control-radius);font:inherit;outline:0}input:focus,select:focus,textarea:focus{background:var(--paper);border-color:var(--hairline);box-shadow:0 0 0 3px color-mix(in srgb,var(--ink) 8%,transparent)}label{display:block;margin-top:10px;font-weight:500}.flash{margin-bottom:16px}.empty{text-align:center;padding:40px}.actions{white-space:nowrap}.desktop-only{display:table-cell}.endpoint-health{min-width:250px;display:grid;gap:8px;line-height:1.35}.endpoint-health-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.endpoint-health-title strong{font-size:13px;line-height:1.3}.endpoint-health-code{display:inline-flex;align-items:center;border:1px solid var(--hairline);border-radius:999px;padding:3px 8px;color:var(--muted);font-size:11px;line-height:1.25}.endpoint-health-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 14px;margin:0}.endpoint-health-meta>div{display:grid;gap:1px;min-width:0}.endpoint-health-meta dt{color:var(--muted);font-size:11px;line-height:1.25}.endpoint-health-meta dd{margin:0;color:var(--ink);font-size:12px;line-height:1.3;white-space:nowrap;font-variant-numeric:tabular-nums}.endpoint-health[data-endpoint-state='healthy'] .endpoint-health-title strong{color:var(--success)}.endpoint-health[data-endpoint-state='down'] .endpoint-health-title strong{color:var(--danger)}.endpoint-health[data-endpoint-state='unknown'] .endpoint-health-title strong{color:var(--muted)}
+*{box-sizing:border-box}[hidden]{display:none!important}html{background:var(--canvas);color-scheme:light}html[data-theme='dark']{color-scheme:dark}body{font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--canvas);color:var(--ink);margin:0;font-size:14px;line-height:1.43;font-feature-settings:"ss01" 1,"cv11" 1;transition:background .18s ease,color .18s ease}a{color:inherit}.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--surface) 92%,transparent);border-bottom:1px solid var(--hairline);backdrop-filter:blur(14px)}.topbar-inner{max-width:1280px;margin:auto;min-height:64px;padding:10px 24px;display:flex;align-items:center;gap:18px}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:600;letter-spacing:-.025em}.brand-mark{width:28px;height:28px;border-radius:9px;background:var(--ink);color:var(--paper);display:grid;place-items:center;font-size:11px}.nav{margin-left:auto;display:flex;align-items:center;gap:6px}.user-chip{color:var(--muted);padding:8px 10px}.wrap{max-width:1280px;margin:auto;padding:44px 24px 64px}.page-head{margin:0 0 28px}.eyebrow{margin:0 0 8px;color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}.page-head h1{font-size:36px;line-height:1.11;letter-spacing:-.025em;margin:0;font-weight:600}.page-head p{max-width:680px;color:var(--muted);font-size:16px}.card{display:block;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:20px;margin:10px 0;color:var(--ink)}a.card{text-decoration:none;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}a.card:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--ink) 22%,var(--hairline))}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.plant-grid{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}.plant-card{min-height:210px;display:flex!important;flex-direction:column;justify-content:space-between}.plant-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.plant-card h2{font-size:24px;line-height:1.33;letter-spacing:-.025em;margin:0}.plant-count{font-size:36px;line-height:1.11;letter-spacing:-.025em;font-weight:600;margin:22px 0 2px}.plant-meta{color:var(--muted);margin:0}.plant-footer{display:flex;align-items:center;justify-content:space-between;margin-top:22px}.status{display:inline-flex;align-items:center;gap:7px;border-radius:18px;padding:4px 9px;font-size:12px;font-weight:500;background:var(--canvas)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--ink)}.status[data-vpn-status='online']{color:var(--success)}.status[data-vpn-status='online'] .status-dot{background:var(--success)}.status[data-vpn-status='offline']{color:var(--danger)}.status[data-vpn-status='offline'] .status-dot{background:var(--danger)}.arrow{font-size:18px}.btn{appearance:none;background:var(--canvas);color:var(--ink);border:0;border-radius:var(--control-radius);min-height:36px;padding:8px 13px;text-decoration:none;margin:3px;display:inline-flex;align-items:center;justify-content:center;gap:7px;font:500 14px/1 inherit;cursor:pointer}.btn:hover{background:var(--hairline)}.btn.primary{background:var(--ink);color:var(--paper)}.btn.primary:hover{background:var(--ink-soft)}.btn.outline{background:transparent;box-shadow:inset 0 0 0 1px var(--hairline)}.btn.danger{color:var(--danger);background:transparent}.page-head.has-action{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:18px}.page-head-title{min-width:0}.page-head-action{display:flex;align-items:center;justify-content:flex-end}.vpn-restart-control{display:flex;align-items:center;gap:10px}.vpn-restart-button{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-width:176px;min-height:44px;padding:0 18px;border:1px solid var(--ink);border-radius:var(--control-radius);background:transparent;color:var(--ink);font:600 13px/1 inherit;letter-spacing:.055em;text-transform:uppercase;position:relative;overflow:hidden;isolation:isolate;cursor:pointer;transition:color .35s,border-color .35s,opacity .2s}.vpn-restart-button span{position:relative;z-index:2}.vpn-restart-button::after{position:absolute;content:"";inset:0;width:0;height:100%;background:var(--danger);z-index:1;transition:width .35s}.vpn-restart-button:hover:not(:disabled){color:#fff;border-color:var(--danger)}.vpn-restart-button:hover:not(:disabled)::after,.vpn-restart-button.is-loading::after{width:100%}.vpn-restart-button.is-loading{color:#fff;border-color:var(--danger);cursor:wait}.vpn-restart-button:disabled{opacity:.72}.vpn-restart-button:focus-visible{outline:3px solid color-mix(in srgb,var(--danger) 34%,transparent);outline-offset:3px}.vpn-restart-feedback{max-width:220px;color:var(--muted);font-size:12px}.vpn-restart-feedback[data-state='success']{color:var(--success)}.vpn-restart-feedback[data-state='error']{color:var(--danger)}.theme-toggle{width:40px;padding:0;font-size:17px}.breadcrumb-row{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}.breadcrumb{display:flex;gap:7px;align-items:center;margin:0;color:var(--muted)}.back-button{margin:0;white-space:nowrap}.breadcrumb a{text-decoration:none}.breadcrumb-current{color:var(--ink)}.summary-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 24px}.badge{display:inline-flex;align-items:center;border-radius:18px;padding:3px 9px;font-size:12px;font-weight:500;background:var(--canvas);color:var(--ink-soft)}.badge.solid{background:var(--ink-soft);color:var(--paper)}.tag-scada{--tag-fg:#1d4ed8;--tag-bg:#eff6ff;--tag-border:#bfdbfe}.tag-trackers{--tag-fg:#b45309;--tag-bg:#fffbeb;--tag-border:#fde68a}.tag-inversores{--tag-fg:#15803d;--tag-bg:#f0fdf4;--tag-border:#bbf7d0}.tag-cctv{--tag-fg:#7e22ce;--tag-bg:#faf5ff;--tag-border:#e9d5ff}.tag-set{--tag-fg:#be123c;--tag-bg:#fff1f2;--tag-border:#fecdd3}[data-theme='dark'] .tag-scada{--tag-fg:#93c5fd;--tag-bg:#172554;--tag-border:#1e40af}[data-theme='dark'] .tag-trackers{--tag-fg:#fcd34d;--tag-bg:#451a03;--tag-border:#92400e}[data-theme='dark'] .tag-inversores{--tag-fg:#86efac;--tag-bg:#052e16;--tag-border:#166534}[data-theme='dark'] .tag-cctv{--tag-fg:#d8b4fe;--tag-bg:#3b0764;--tag-border:#7e22ce}[data-theme='dark'] .tag-set{--tag-fg:#fda4af;--tag-bg:#4c0519;--tag-border:#9f1239}.tag-badge{margin:2px 4px 2px 0;color:var(--tag-fg);background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-border)}.equipment-tags{min-width:150px}.tag-filter{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:var(--paper);border:1px solid var(--hairline);border-radius:var(--card-radius);box-shadow:var(--shadow);padding:14px 16px;margin:0 0 14px}.tag-filter-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.tag-filter-options{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.tag-filter-option{display:inline-flex;align-items:center;gap:6px;margin:0;padding:6px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:color-mix(in srgb,var(--tag-bg) 68%,var(--paper));color:var(--tag-fg);font-size:12px;font-weight:600;cursor:pointer;transition:background .15s ease,box-shadow .15s ease,transform .15s ease}.tag-filter-option:hover{background:var(--tag-bg);transform:translateY(-1px)}.tag-filter-option.is-active{background:var(--tag-bg);box-shadow:inset 0 0 0 1px var(--tag-fg)}.tag-filter-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.tag-filter-clear{min-height:30px;padding:6px 10px;font-size:12px}.tag-filter-clear:disabled{opacity:.42;cursor:default}.tag-filter-empty{padding:26px;text-align:center}.tag-picker{border:1px solid var(--hairline);border-radius:var(--control-radius);padding:14px 16px;margin:16px 0}.tag-picker legend{font-weight:600;padding:0 6px}.tag-picker p{margin:0 0 8px}.tag-options{display:flex;flex-wrap:wrap;gap:8px}.tag-option{display:inline-flex;align-items:center;gap:7px;margin:0;padding:7px 10px;border:1px solid var(--tag-border);border-radius:var(--control-radius);background:var(--tag-bg);color:var(--tag-fg);cursor:pointer}.tag-option input{width:auto;margin:0;accent-color:var(--tag-fg)}.table-card{padding:0;overflow:hidden}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid var(--hairline);padding:14px 16px;text-align:left;vertical-align:middle}th{background:var(--surface);color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--canvas) 65%,transparent)}.sort-button{appearance:none;border:0;background:transparent;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit;padding:0;cursor:pointer;display:inline-flex;align-items:center;gap:6px}.sort-button::after{content:"↕";opacity:.45}.sort-button[data-direction='asc']::after{content:"↑";opacity:1}.sort-button[data-direction='desc']::after{content:"↓";opacity:1}.equipment-name{font-weight:600}.url{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:13px}.muted{color:var(--muted)}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}.vpn-form h3{margin-top:28px;border-bottom:1px solid var(--hairline);padding-bottom:9px}.error{border-color:var(--danger);color:var(--danger)}input,select,textarea{width:100%;padding:10px 12px;background:var(--canvas);color:var(--ink);border:1px solid transparent;border-radius:var(--control-radius);font:inherit;outline:0}input:focus,select:focus,textarea:focus{background:var(--paper);border-color:var(--hairline);box-shadow:0 0 0 3px color-mix(in srgb,var(--ink) 8%,transparent)}label{display:block;margin-top:10px;font-weight:500}.flash{margin-bottom:16px}.empty{text-align:center;padding:40px}.actions{white-space:nowrap}.desktop-only{display:table-cell}.endpoint-health{min-width:250px;display:grid;gap:8px;line-height:1.35}.endpoint-health-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.endpoint-health-title strong{font-size:13px;line-height:1.3}.endpoint-health-code{display:inline-flex;align-items:center;border:1px solid var(--hairline);border-radius:999px;padding:3px 8px;color:var(--muted);font-size:11px;line-height:1.25}.endpoint-health-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 14px;margin:0}.endpoint-health-meta>div{display:grid;gap:1px;min-width:0}.endpoint-health-meta dt{color:var(--muted);font-size:11px;line-height:1.25}.endpoint-health-meta dd{margin:0;color:var(--ink);font-size:12px;line-height:1.3;white-space:nowrap;font-variant-numeric:tabular-nums}.endpoint-health[data-endpoint-state='accessible'] .endpoint-health-title strong{color:var(--success)}.endpoint-health[data-endpoint-state='unreachable'] .endpoint-health-title strong{color:var(--danger)}
 @media(max-width:760px){.page-head.has-action{grid-template-columns:1fr;align-items:start}.page-head-action{justify-content:flex-start}.vpn-restart-control{align-items:flex-start;flex-direction:column}.vpn-restart-button{min-width:164px}.topbar-inner{padding:9px 14px}.user-chip{display:none}.wrap{padding:28px 14px 48px}.page-head h1{font-size:30px}.plant-grid{grid-template-columns:1fr}.desktop-only{display:none}.endpoint-health{min-width:220px}.endpoint-health-meta{grid-template-columns:1fr}th,td{padding:12px}.brand-text{display:none}}
 """
 THEME_SCRIPT=r"""<script>(function(){try{var saved=localStorage.getItem('theme');var preferred=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=saved||preferred}catch(e){}})();function syncThemeButton(){var b=document.getElementById('theme-toggle');if(!b)return;var dark=document.documentElement.dataset.theme==='dark';b.textContent=dark?'☀':'☾';b.setAttribute('aria-label',dark?'Activar modo claro':'Activar modo nocturno');b.title=b.getAttribute('aria-label')}function toggleTheme(){var next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;localStorage.setItem('theme',next);syncThemeButton()}document.addEventListener('DOMContentLoaded',syncThemeButton);</script>"""
@@ -669,9 +704,7 @@ def idx():
             try:online=vpn_runtime(vpn)[0]
             except Exception:online=False
         status='online' if online else 'offline';web=sum(1 for e in items if e['kind']=='WEB');rdp=sum(1 for e in items if e['kind']=='RDP');vnc=sum(1 for e in items if e['kind']=='VNC');href='/plant/'+quote(plant,safe='');equipment_copy='equipo disponible' if len(items)==1 else 'equipos disponibles'
-        health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None
-        alert=endpoint_card_alert(health,online,admin_view=me()['role']=='admin')
-        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div>{alert}<div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
+        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div><div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
     return page('Panel de accesos',b+'</div>')
 @app.route('/plant/<path:plant>')
 @need
@@ -682,9 +715,9 @@ def plant_access(plant):
     if vpn:
         try:online=vpn_runtime(vpn)[0]
         except Exception:online=False
-    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None;back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
+    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
     plant_url=quote(canonical,safe='');head_action=(f"<div class='vpn-restart-control'><button class='vpn-restart-button' type='button' data-restart-url='/plant/{plant_url}/vpn/restart' data-restart-csrf='{h(csrf_token())}' onclick='restartPlantVpn(this)'><span>Reiniciar VPN</span></button><span class='vpn-restart-feedback' id='vpn-restart-feedback' role='status' aria-live='polite'></span></div>" if vpn else '')
-    b=(back+endpoint_card_alert(health,online,admin_view=me()['role']=='admin')+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
+    b=(back+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
     for e in items:
         name=html.escape(e['name']);kind=html.escape(e['kind']);ip=html.escape(e['real_ip']);port=html.escape(str(e['real_port']));desc=html.escape(e['description'] or '—')
         tags=equipment_tag_names(db(),e['id']);tag_sort='|'.join(tag.casefold() for tag in tags);tag_filter=','.join(tag.casefold() for tag in tags);tag_badges=equipment_tag_badges(tags)
@@ -810,7 +843,7 @@ def gen_access_vpn(v, sl):
     raise ValueError('Tipo de VPN de acceso no válido.')
 
 def apply_vpn(v):
-    sl=v['slug']; os.makedirs(f'{BASE}/configs/{sl}',exist_ok=True); os.makedirs(f'{BASE}/sites/{sl}',exist_ok=True)
+    sl=v['slug']; os.makedirs(f'{BASE}/configs/{sl}',exist_ok=True); os.makedirs(plant_artifact_dir(BASE,sl),exist_ok=True)
     ensure_haproxy(sl,v['plant'])
     vpn_type=v['vpn_type'] or 'ssl'; is_ipsec=vpn_type=='ipsec'; is_access=vpn_type in {'pptp','openvpn'}
     auto_remote=is_ipsec and (v['ike_version'] or 'ikev1')=='ikev1' and (v['ipsec_engine'] or 'libreswan')=='libreswan' and int(v['aggressive'] or 0)==1 and not (v['remote_id'] or '').strip()
@@ -1204,7 +1237,7 @@ def vpn_new_kind(kind):
     except (ValueError,sqlite3.IntegrityError) as e:return page('Nueva VPN '+kind.upper(),vf(request.form,kind,str(e))),400
 def reset_inactive_vpn_draft(v):
     sl=v['slug'];subprocess.run(['docker','rm','-f','vpn-'+sl],text=True,capture_output=True,timeout=60)
-    for path in (f'{BASE}/configs/{sl}',f'{BASE}/sites/{sl}'):
+    for path in (f'{BASE}/configs/{sl}',plant_artifact_dir(BASE,sl)):
         if os.path.isdir(path):shutil.rmtree(path)
     db().execute("UPDATE vpns SET active=0,onboarding_state='draft',validation_stage='local',validation_code='pending',validation_detail='Pendiente de validación local.',next_retry_at=NULL,retry_count=0 WHERE id=?",(v['id'],));db().commit()
 
@@ -1231,7 +1264,8 @@ def vpn_edit(i):
             reset_inactive_vpn_draft(v2)
         except (ValueError,sqlite3.IntegrityError) as e:return page('Editar VPN '+kind.upper(),vf(v,kind,str(e))),400
         flash('Borrador actualizado; volverá a validarse de forma aislada.');return redirect('/admin/vpns')
-    return page('Editar VPN '+kind.upper(),vf(v,kind))
+    health=endpoint_health_map([v]).get(int(v['id']))
+    return page('Editar VPN '+kind.upper(),vf(v,kind)+endpoint_health_admin_markup(health)+endpoint_history_admin_markup(i))
 
 def ensure_haproxy(sl, plant):
     hp=f'{BASE}/configs/{sl}/haproxy.cfg'
@@ -1273,8 +1307,8 @@ networks:
     external: true
     name: vpn_bastion_net
 '''
-    os.makedirs(f'{BASE}/sites/{sl}',exist_ok=True)
-    with open(f'{BASE}/sites/{sl}/compose.yml','w') as fh: fh.write(compose)
+    os.makedirs(plant_artifact_dir(BASE,sl),exist_ok=True)
+    with open(plant_artifact_dir(BASE,sl)/'compose.yml','w') as fh: fh.write(compose)
 
 def openvpn_profile_with_local_secrets(profile, requires_auth, requires_key_pass):
     lines=[]; inline=None; legacy_cbc=False; has_data_ciphers=False
@@ -1385,8 +1419,16 @@ networks:
     external: true
     name: vpn_bastion_net
 """
-    with open(f'{BASE}/sites/{sl}/compose.yml','w') as fh: fh.write(compose)
+    with open(plant_artifact_dir(BASE,sl)/'compose.yml','w') as fh: fh.write(compose)
+def plant_uses_bridge_tls(sl):
+    row=db().execute("SELECT 1 FROM vpns v JOIN equipment e ON e.plant=v.plant WHERE v.slug=? AND e.active=1 AND e.kind='WEB' AND (e.web_mode='bridge_tls' OR e.web_effective_mode='bridge_tls') LIMIT 1",(sl,)).fetchone()
+    if not row: return False
+    cert=os.path.join(BASE,"configs","bridge.pem")
+    if not os.path.isfile(cert): raise ValueError(f"Falta el certificado TLS del bastión para la planta {sl}.")
+    return True
+
 def write_ipsec_compose(sl,engine):
+    bridge_mount=("      - ./configs/bridge.pem:/etc/haproxy/certs/bridge.pem:ro\n" if plant_uses_bridge_tls(sl) else "")
     compose=f"""services:
   vpn-{sl}:
     image: {runtime_image('ipsec',engine)}
@@ -1402,7 +1444,7 @@ def write_ipsec_compose(sl,engine):
       - ./configs/{sl}/ipsec.conf:/etc/ipsec.conf:ro
       - ./configs/{sl}/ipsec.secrets:/etc/ipsec.secrets:ro
       - ./configs/{sl}/haproxy.cfg:/etc/haproxy/haproxy.cfg:ro
-    environment:
+{bridge_mount}    environment:
       VPN_READY_TIMEOUT: '120'
     networks:
       - bastion
@@ -1411,7 +1453,7 @@ networks:
     external: true
     name: vpn_bastion_net
 """
-    with open(f'{BASE}/sites/{sl}/compose.yml','w') as fh:fh.write(compose)
+    with open(plant_artifact_dir(BASE,sl)/'compose.yml','w') as fh:fh.write(compose)
 
 def gen_ikev2_eap(v,sl):
     v=dict(v);local=(v.get('local_id') or '').strip();leftid=(local if local.startswith('@') else '@'+local) if local else '%any';leftid_line=('    leftid='+leftid+'\n') if local else ''
@@ -1543,7 +1585,7 @@ networks:
     external: true
     name: vpn_bastion_net
 """
-    with open(f'{BASE}/sites/{sl}/compose.yml','w') as fh: fh.write(compose)
+    with open(plant_artifact_dir(BASE,sl)/'compose.yml','w') as fh: fh.write(compose)
 @app.route('/admin/vpns/<int:i>/generate',methods=['POST'])
 @admin
 @vpn_mutation_lock
@@ -1649,14 +1691,15 @@ def equipment_by_plant(plant):
 @app.route('/admin/equipment/import/template.csv')
 @admin
 def equipment_import_template():
-    content=("nombre;tipo;ip;puerto;ruta;puerto_publico;modo_web;url_publica;descripcion;usuario_rdp;password_rdp;dominio_rdp;remote_app;tags\\r\\n"
-             "Web directo;WEB;192.0.2.10;80;/;;direct;;Acceso directo;;;;Scada\\r\\n"
-             "Web compatible;WEB;192.0.2.11;80;/;;rewrite_cache;;Reescritura y caché;;;;CCTV\\r\\n"
-             "Web automático;WEB;192.0.2.12;80;/;;auto;;Diagnóstico automático;;;;Inversores|SET\\r\\n")
+    content=("nombre;tipo;ip;puerto;ruta;puerto_publico;modo_web;host_bridge_tls;url_publica;descripcion;usuario_rdp;password_rdp;dominio_rdp;remote_app;tags\\r\\n"
+             "Web directo;WEB;192.0.2.10;80;/;;direct;;;Acceso directo;;;;Scada\\r\\n"
+             "Web compatible;WEB;192.0.2.11;80;/;;rewrite_cache;;;Reescritura y caché;;;;CCTV\\r\\n"
+             "Web bridge TLS;WEB;192.0.2.12;443;/;;bridge_tls;ejemplo.dominio;;Bridge TLS;;;;Scada\\r\\n"
+             "Web automático;WEB;192.0.2.13;80;/;;auto;;;Diagnóstico automático;;;;Inversores|SET\\r\\n")
     return Response(content,content_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=plantilla_equipos.csv'})
 
 EQUIPMENT_EXPORT_CODEC='plantas-vpn-safe-v1'
-EQUIPMENT_EXPORT_HEADERS=('nombre','tipo','ip','puerto','ruta','url_publica','puerto_publico','modo_web','descripcion','remote_app','vnc_password_enc','vnc_read_only','tags','_csv_codec')
+EQUIPMENT_EXPORT_HEADERS=('nombre','tipo','ip','puerto','ruta','url_publica','puerto_publico','modo_web','host_bridge_tls','descripcion','remote_app','vnc_password_enc','vnc_read_only','tags','_csv_codec')
 def spreadsheet_safe_csv_cell(value):
     text='' if value is None else str(value)
     if text.startswith("'") or text.lstrip(' \t\r\n').startswith(('=','+','-','@')): return "'"+text
@@ -1672,7 +1715,7 @@ def equipment_export_csv(rows,tags_by_id):
     writer=csv.writer(stream,delimiter=';',lineterminator='\r\n')
     writer.writerow(EQUIPMENT_EXPORT_HEADERS)
     for e in rows:
-        values=(e['name'],e['kind'],e['real_ip'],e['real_port'],e['path'] or '/',e['public_url'] or '',e['proxy_port'] or public_port_from_url(e['public_url']) or '',e['web_mode'] if e['web_mode'] in {'auto','direct','rewrite_cache'} else 'auto',e['description'] or '',e['rdp_remote_app'] or '',(e['vnc_password_enc'] or '') if e['kind']=='VNC' else '',e['vnc_read_only'] or 0 if e['kind']=='VNC' else 0,'|'.join(tags_by_id.get(e['id'],[])))
+        values=(e['name'],e['kind'],e['real_ip'],e['real_port'],e['path'] or '/',e['public_url'] or '',e['proxy_port'] or public_port_from_url(e['public_url']) or '',e['web_mode'] if e['web_mode'] in WEB_MODES else 'auto',e['web_bridge_host'] if e['kind']=='WEB' and e['web_mode']=='bridge_tls' else '',e['description'] or '',e['rdp_remote_app'] or '',(e['vnc_password_enc'] or '') if e['kind']=='VNC' else '',e['vnc_read_only'] or 0 if e['kind']=='VNC' else 0,'|'.join(tags_by_id.get(e['id'],[])))
         writer.writerow([*(spreadsheet_safe_csv_cell(value) for value in values),EQUIPMENT_EXPORT_CODEC])
     return '﻿'+stream.getvalue()
 
@@ -1693,7 +1736,7 @@ def equipment_bulk_import(plant):
     plant=canonical_plant_name(plant)
     if not plant: abort(404)
     qplant=quote(plant,safe='')
-    body=f"""<a class=btn href='/admin/equipment/plant/{qplant}'>← Equipos de {html.escape(plant)}</a><div class=card><h2>Importar equipos</h2><p>Suba un CSV UTF-8 separado por coma o punto y coma. Todos los equipos se añadirán a <strong>{html.escape(plant)}</strong>.</p><p>En <code>modo_web</code> use: <strong>auto, direct, rewrite_cache</strong>. En modo auto cada equipo WEB se analiza desde la VPN de esta planta antes de publicar.</p><p>Las columnas obligatorias son: nombre, tipo, ip, puerto y modo_web. Puerto público vacío se asigna automáticamente.</p><p>Para filas VNC, <code>vnc_password_enc</code> debe contener el ciphertext generado por este panel; nunca introduzca la contraseña en claro. La exportación del panel ya incluye ese valor cifrado y <code>vnc_read_only</code>.</p><p>La columna opcional <code>tags</code> admite: <strong>Scada, Trackers, Inversores, CCTV, SET</strong>. Separe varios tags con <code>|</code>.</p><a class='btn' href='/admin/equipment/import/template.csv'>Descargar plantilla CSV</a><a class='btn' href='/admin/equipment/plant/{qplant}/export.csv'>Exportar equipos CSV</a><form method=post enctype='multipart/form-data'><label>Archivo CSV</label><input type=file name=csv_file accept='.csv,text/csv' required><button class='btn primary'>Validar, importar y publicar</button></form></div>"""
+    body=f"""<a class=btn href='/admin/equipment/plant/{qplant}'>← Equipos de {html.escape(plant)}</a><div class=card><h2>Importar equipos</h2><p>Suba un CSV UTF-8 separado por coma o punto y coma. Todos los equipos se añadirán a <strong>{html.escape(plant)}</strong>.</p><p>En <code>modo_web</code> use: <strong>auto, direct, rewrite_cache, bridge_tls</strong>. En modo auto cada equipo WEB se analiza desde la VPN de esta planta antes de publicar.</p><p>Las columnas obligatorias son: nombre, tipo, ip, puerto y modo_web. Puerto público vacío se asigna automáticamente.</p><p>Para filas VNC, <code>vnc_password_enc</code> debe contener el ciphertext generado por este panel; nunca introduzca la contraseña en claro. La exportación del panel ya incluye ese valor cifrado y <code>vnc_read_only</code>.</p><p>La columna opcional <code>tags</code> admite: <strong>Scada, Trackers, Inversores, CCTV, SET</strong>. Separe varios tags con <code>|</code>.</p><a class='btn' href='/admin/equipment/import/template.csv'>Descargar plantilla CSV</a><a class='btn' href='/admin/equipment/plant/{qplant}/export.csv'>Exportar equipos CSV</a><form method=post enctype='multipart/form-data'><label>Archivo CSV</label><input type=file name=csv_file accept='.csv,text/csv' required><button class='btn primary'>Validar, importar y publicar</button></form></div>"""
     if request.method=='GET': return page('Importar equipos · '+plant,body)
     policy=(request.form.get('duplicate_policy') or '').strip();batch_token=(request.form.get('batch_token') or '').strip()
     if batch_token:
@@ -1740,9 +1783,9 @@ def equipment_bulk_import(plant):
         now=datetime.now().isoformat(timespec='seconds')
         for eid,f,old in finalized:
             public_url=f'/equipment/{eid}/{f["kind"].lower()}' if f['kind'] in {'RDP','VNC'} else f['public_url']
-            values=(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'])
-            if old: conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=? WHERE id=?',values+(eid,))
-            else: conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,)+values[:8]+(1,now)+values[8:])
+            values=(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'])
+            if old: conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=?,web_bridge_host=? WHERE id=?',values+(eid,))
+            else: conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port,web_bridge_host) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,)+values[:8]+(1,now)+values[8:])
             set_equipment_tags(conn,eid,f['tags'])
         ports=publish_plant(plant)
         if batch_token: conn.execute('DELETE FROM equipment_import_batches WHERE token=?',(batch_token,))
@@ -1772,13 +1815,14 @@ def next_public_port():
     for r in db().execute("SELECT public_url,proxy_port FROM equipment"):
         p=r['proxy_port'] or public_port_from_url(r['public_url'])
         if p: used.add(int(p))
-    for root,dirs,files in os.walk(f'{BASE}/sites'):
-        for fn in files:
-            if fn.endswith(('.yml','.yaml')):
-                try:
-                    txt=open(os.path.join(root,fn)).read()
-                    for m in re.finditer(r':(\d+):\d+', txt): used.add(int(m.group(1)))
-                except Exception: pass
+    for artifact_root in (f'{BASE}/plants',f'{BASE}/sites'):
+        for root,dirs,files in os.walk(artifact_root):
+            for fn in files:
+                if fn.endswith(('.yml','.yaml')):
+                    try:
+                        txt=open(os.path.join(root,fn)).read()
+                        for m in re.finditer(r':(\d+):\d+', txt): used.add(int(m.group(1)))
+                    except Exception: pass
     p=8081
     while p in used: p+=1
     return p
@@ -1793,9 +1837,10 @@ def ef(e=None, rdp_import=False, locked_plant=None):
         locked_plant=locked_plant.strip(); plant_field=f"<label>Planta</label><div class='card'><strong>{esc(locked_plant)}</strong></div><input type='hidden' name='plant' value='{esc(locked_plant)}'>"
     else: plant_field=f"<label>Planta</label><select name='plant' required>{popts}</select>"
     pub_port=e.get('proxy_port') or public_port_from_url(e.get('public_url','')) or ''
-    web_mode=e.get('web_mode') if e.get('web_mode') in {'auto','direct','rewrite_cache'} else 'auto'
-    web_mode_options=[('auto','Automático (recomendado)'),('direct','Directo'),('rewrite_cache','Reescritura y caché')]
+    web_mode=e.get('web_mode') if e.get('web_mode') in WEB_MODES else 'auto'
+    web_mode_options=[('auto','Automático (recomendado)'),('direct','Directo'),('rewrite_cache','Reescritura y caché'),('bridge_tls','Bridge TLS (HTTPS en el frontal)')]
     wmopts=''.join(f"<option value='{value}' {'selected' if web_mode==value else ''}>{label}</option>" for value,label in web_mode_options)
+    bridge_host=esc(e.get('web_bridge_host'))
     raw_tags=e.get('tags',equipment_tag_names(db(),e['id']) if e.get('id') else [])
     if isinstance(raw_tags,str): raw_tags=re.split(r'[|,]',raw_tags)
     tag_lookup={name.casefold():name for name in EQUIPMENT_TAG_CATALOG};selected_tags={tag_lookup[str(value).strip().casefold()] for value in (raw_tags or []) if str(value).strip().casefold() in tag_lookup}
@@ -1809,7 +1854,7 @@ def ef(e=None, rdp_import=False, locked_plant=None):
 {tag_picker}
 <label>IP real del equipo</label><input name='real_ip' value='{esc(e.get('real_ip'))}' required>
 <label>Puerto real</label><input name='real_port' id='real-port' value='{esc(e.get('real_port'))}' placeholder='80/443 WEB; 3389 RDP; 5900 VNC'>
-<div id='web-fields'><label>Tratamiento web</label><select name='web_mode'>{wmopts}</select><p class='muted'>Automático analiza redirecciones y URLs privadas; puede forzar acceso directo o reescritura y caché.</p>{web_diag}<label>Ruta web</label><input name='path' value='{esc(e.get('path') or '/')}'><label>Puerto público bastión</label><input name='public_port' value='{esc(pub_port)}' placeholder='vacío = automático'><label>URL pública/enlace</label><input name='public_url' value='{esc(e.get('public_url'))}' placeholder='vacío = se genera automáticamente'></div>
+<div id='web-fields'><label>Tratamiento web</label><select name='web_mode'>{wmopts}</select><p class='muted'>Automático analiza redirecciones y URLs privadas; puede forzar acceso directo, reescritura/caché o bridge TLS.</p>{web_diag}<label>Host canónico para bridge TLS</label><input name='web_bridge_host' value='{bridge_host}' placeholder='ejemplo.dominio'><p class='muted'>Solo se usa en bridge TLS; el panel fija Host, SNI y redirecciones del origen.</p><label>Ruta web</label><input name='path' value='{esc(e.get('path') or '/')}'><label>Puerto público bastión</label><input name='public_port' value='{esc(pub_port)}' placeholder='vacío = automático'><label>URL pública/enlace</label><input name='public_url' value='{esc(e.get('public_url'))}' placeholder='vacío = se genera automáticamente'></div>
 <div id='rdp-fields'><h3>Credenciales RDP</h3><p class='muted'>Se cifran en el panel y se entregan a Guacamole mediante un token cifrado de 60 segundos. Si ya existe contraseña, dejarla vacía la conserva.</p>{import_field}<label>Usuario RDP</label><input name='rdp_username' value='{esc(ruser)}' autocomplete='off' placeholder='usuario o usuario@dominio'><label>Contraseña RDP</label><input name='rdp_password' type='password' autocomplete='new-password' placeholder='vacío = conservar la existente'><label>Dominio (opcional)</label><input name='rdp_domain' value='{esc(rdomain)}' autocomplete='off'><label>Alias RemoteApp (opcional)</label><input name='rdp_remote_app' value='{esc(e.get('rdp_remote_app',''))}' autocomplete='off' placeholder='Ej.: GPM+Híjar3'><p class='muted'>Solo si el equipo publica una RemoteApp; introduzca el alias sin los dos caracteres | iniciales.</p></div>
 <div id='vnc-fields'><h3>Acceso VNC</h3><p class='muted'>La contraseña se cifra en el panel y se entrega a Guacamole mediante un token cifrado de 60 segundos. Si ya existe contraseña, dejarla vacía la conserva.</p><label>Contraseña VNC</label><input name='vnc_password' type='password' autocomplete='new-password' placeholder='vacío = conservar la existente'><label><input name='vnc_read_only' type='checkbox' value='1' {'checked' if e.get('vnc_read_only') else ''} style='width:auto'> Solo lectura</label></div>
 <label>Descripción</label><textarea name='description'>{esc(e.get('description'))}</textarea><button class='btn primary'>Guardar y publicar</button></form>
@@ -1862,7 +1907,9 @@ def equipment_values(f, old=None):
     kind=(f.get('kind') or 'WEB').upper()
     if kind not in {'WEB','RDP','VNC'}: raise ValueError('El tipo de equipo debe ser WEB, RDP o VNC')
     web_mode=(f.get('web_mode') or old.get('web_mode') or 'auto').strip().lower() if kind=='WEB' else 'direct'
-    if web_mode not in {'auto','direct','rewrite_cache'}: raise ValueError('El tratamiento web debe ser automático, directo o reescritura y caché')
+    if web_mode not in WEB_MODES: raise ValueError('El tratamiento web debe ser automático, directo, reescritura y caché o bridge TLS')
+    web_bridge_host=(f.get('web_bridge_host') or old.get('web_bridge_host') or '').strip() if kind=='WEB' and web_mode=='bridge_tls' else ''
+    if web_mode=='bridge_tls': web_bridge_host=normalize_web_bridge_host(web_bridge_host)
     plant=(f.get('plant') or '').strip(); name=(f.get('name') or '').strip(); real_ip=(f.get('real_ip') or '').strip()
     if not plant or not name or not real_ip: raise ValueError('Planta, nombre e IP real son obligatorios')
     tags=normalize_equipment_tags(f.get('tags',[]))
@@ -1880,7 +1927,7 @@ def equipment_values(f, old=None):
         if bool(user_enc) != bool(pass_enc): raise ValueError('Para RDP indique usuario y contraseña, o deje ambos vacíos')
         if len(remote_app)>255 or any(ord(ch)<32 for ch in remote_app): raise ValueError('Alias RemoteApp inválido')
         remote_app=remote_app[2:] if remote_app.startswith('||') else remote_app
-        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,rdp_username_enc=user_enc,rdp_password_enc=pass_enc,rdp_domain_enc=domain_enc,rdp_remote_app=remote_app,vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
+        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,web_bridge_host='',rdp_username_enc=user_enc,rdp_password_enc=pass_enc,rdp_domain_enc=domain_enc,rdp_remote_app=remote_app,vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
     if kind=='VNC':
         vpass=f.get('vnc_password') or ''
         imported_enc=(f.get('vnc_password_enc') or '').strip()
@@ -1890,14 +1937,22 @@ def equipment_values(f, old=None):
         else:
             pass_enc=enc(vpass) if vpass else old.get('vnc_password_enc','')
         read_only=1 if str(f.get('vnc_read_only') or '').lower() in {'1','true','on','yes'} else 0
-        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc=pass_enc,vnc_read_only=read_only,description=f.get('description',''),tags=tags)
+        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,web_bridge_host='',rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc=pass_enc,vnc_read_only=read_only,description=f.get('description',''),tags=tags)
     path=(f.get('path') or '/').strip()
     pub_url=(f.get('public_url') or '').strip()
     if not pub_url:
         suffix=path if path else '/'
         if not suffix.startswith('/'): suffix='/'+suffix
-        pub_url=f'{PUBLIC_ORIGIN}:{proxy_port}{suffix}'
-    return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path=path,public_url=pub_url,proxy_port=proxy_port,web_mode=web_mode,rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
+        if web_mode=='bridge_tls':
+            origin=urlsplit(PUBLIC_ORIGIN)
+            if not origin.netloc: raise ValueError('No se pudo construir la URL pública HTTPS del bridge TLS')
+            pub_url=f'https://{origin.netloc}:{proxy_port}{suffix}'
+        else:
+            pub_url=f'{PUBLIC_ORIGIN}:{proxy_port}{suffix}'
+    if web_mode=='bridge_tls':
+        parsed=urlsplit(pub_url)
+        if parsed.scheme.lower()!='https' or not parsed.netloc: raise ValueError('El bridge TLS requiere una URL pública HTTPS')
+    return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path=path,public_url=pub_url,proxy_port=proxy_port,web_mode=web_mode,web_bridge_host=web_bridge_host,rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
 def equipment_ip_key(value):
     value=str(value or '').strip()
     try: return ipaddress.ip_address(value).compressed.casefold()
@@ -1940,7 +1995,7 @@ def parse_bulk_csv(raw, plant, used_ports=None, existing_by_ip=None):
             while public_port in used: public_port+=1
             if public_port>65535: raise ValueError('No quedan puertos públicos disponibles')
         used.add(public_port)
-        form={'plant':plant,'name':value(row,'nombre'),'kind':value(row,'tipo'),'real_ip':real_ip,'real_port':value(row,'puerto'),'path':value(row,'ruta') or '/','public_port':str(public_port),'public_url':value(row,'url_publica'),'web_mode':value(row,'modo_web') or 'auto','description':value(row,'descripcion'),'rdp_username':value(row,'usuario_rdp'),'rdp_password':value(row,'password_rdp'),'rdp_domain':value(row,'dominio_rdp'),'rdp_remote_app':value(row,'remote_app'),'vnc_password_enc':vnc_cipher,'vnc_read_only':value(row,'vnc_read_only'),'tags':value(row,'tags')}
+        form={'plant':plant,'name':value(row,'nombre'),'kind':value(row,'tipo'),'real_ip':real_ip,'real_port':value(row,'puerto'),'path':value(row,'ruta') or '/','public_port':str(public_port),'public_url':value(row,'url_publica'),'web_mode':value(row,'modo_web') or 'auto','web_bridge_host':value(row,'host_bridge_tls'),'description':value(row,'descripcion'),'rdp_username':value(row,'usuario_rdp'),'rdp_password':value(row,'password_rdp'),'rdp_domain':value(row,'dominio_rdp'),'rdp_remote_app':value(row,'remote_app'),'vnc_password_enc':vnc_cipher,'vnc_read_only':value(row,'vnc_read_only'),'tags':value(row,'tags')}
         try:
             item=equipment_values(form,old)
             if (row.get(headers.get('_csv_codec','')) or '').strip()==EQUIPMENT_EXPORT_CODEC: item['name']=value(row,'nombre')
@@ -1990,10 +2045,21 @@ def web_redirect_rules(real_ip, real_port, public_url):
             f"    http-response replace-header Location ^https?://{target}(?::{port})?(/.*)?$ {scheme}://%[var(txn.public_host)]\\1\n"
             )
 
+def bridge_tls_redirect_rules(bridge_host, real_port):
+    host=normalize_web_bridge_host(bridge_host)
+    target=re.escape(host); port=re.escape(str(real_port))
+    return ("    http-request set-var(txn.public_host) req.hdr(Host)\n"
+            f"    http-request set-header Host {host}\n"
+            "    http-request set-header X-Forwarded-Proto https\n"
+            f"    http-response replace-header Location ^https?://{target}(?::{port})?(/.*)?$ https://%[var(txn.public_host)]\\1\n"
+            )
+
 def finalize_web_settings(values, equipment_id, old=None):
     result=dict(values); old=dict(old) if old else {}
     if result['kind']!='WEB':
-        result.update(web_effective_mode='direct',web_diagnostic='',web_proxy_port=None); return result
+        result.update(web_effective_mode='direct',web_diagnostic='',web_proxy_port=None,web_bridge_host=''); return result
+    if result.get('web_mode')=='bridge_tls':
+        result['web_bridge_host']=normalize_web_bridge_host(result.get('web_bridge_host') or old.get('web_bridge_host'))
     vpn=vpn_for_plant(result['plant'])
     if not vpn: raise ValueError(f"No hay VPN configurada para la planta {result['plant']}")
     analysis=probe_web_equipment(vpn['slug'],result['real_ip'],result['real_port'],result['web_mode'])
@@ -2005,7 +2071,7 @@ def finalize_web_settings(values, equipment_id, old=None):
     return result
 
 def probe_web_equipment(slug, real_ip, real_port, requested_mode, runner=subprocess.run):
-    if requested_mode in {'direct','rewrite_cache'}:
+    if requested_mode in {'direct','rewrite_cache','bridge_tls'}:
         return resolve_web_mode(requested_mode,{'effective_mode':'direct','diagnostic':''})
     scheme='https' if str(real_port)=='443' else 'http'; url=f'{scheme}://{real_ip}:{real_port}/'
     base=['docker','exec',f'vpn-{slug}','curl','-k','-sS','--connect-timeout','5','--max-time','20']
@@ -2030,6 +2096,7 @@ def analyze_web_probe(headers, body, real_ip, real_port):
 def resolve_web_mode(requested, analysis):
     if requested=='direct': return {'effective_mode':'direct','diagnostic':'Modo directo forzado por el administrador'}
     if requested=='rewrite_cache': return {'effective_mode':'rewrite_cache','diagnostic':'Reescritura y caché forzadas por el administrador'}
+    if requested=='bridge_tls': return {'effective_mode':'bridge_tls','diagnostic':'Bridge TLS forzado por el administrador'}
     return dict(analysis)
 
 def row_value(row, key, default=None):
@@ -2090,12 +2157,26 @@ def render_haproxy_for_plant(plant):
         if e['kind'] not in {'WEB','RDP','VNC'}: continue
         p=e['proxy_port'] or public_port_from_url(e['public_url'])
         if not p or not e['real_ip'] or not e['real_port']: continue
-        if e['kind']=='WEB': exposed.append(int(p))
+        if e['kind']=='WEB':
+            exposed.append(int(p)); effective=str(e['web_effective_mode'] or 'direct')
+            if effective not in WEB_EFFECTIVE_MODES:
+                raise ValueError(f"Modo WEB efectivo no válido para el equipo {e['id']}")
+        else: effective='direct'
         name=re.sub('[^a-zA-Z0-9_]+','_',f"{e['plant']}_{e['name']}_{e['id']}").lower()
-        mode='tcp' if e['kind']=='WEB' and e['web_effective_mode']=='direct' else ('http' if e['kind']=='WEB' else 'tcp')
-        sslopt=' ssl verify none' if e['kind']=='WEB' and str(e['real_port'])=='443' else ''
-        redirect_rules=web_redirect_rules(e['real_ip'],e['real_port'],e['public_url']) if e['kind']=='WEB' and mode=='http' else ''
-        cfg+=f'frontend {name}\n    bind *:{p}\n    mode {mode}\n{redirect_rules}    default_backend {name}_backend\n\nbackend {name}_backend\n    mode {mode}\n    server target {web_backend_target(plant,e)}{sslopt}\n\n'
+        if e['kind']=='WEB' and effective=='bridge_tls':
+            bridge_host=normalize_web_bridge_host(e['web_bridge_host'])
+            mode='http'; bind=f'bind *:{p} ssl crt {BRIDGE_TLS_CERT}'
+            redirect_rules=bridge_tls_redirect_rules(bridge_host,e['real_port'])
+            sslopt=f' ssl verify none sni str({bridge_host}) ciphers {BRIDGE_TLS_CIPHERS}'
+        elif e['kind']=='WEB' and effective=='direct':
+            mode='tcp'; bind=f'bind *:{p}'; redirect_rules=''; sslopt=''
+        elif e['kind']=='WEB':
+            mode='http'; bind=f'bind *:{p}'; redirect_rules=web_redirect_rules(e['real_ip'],e['real_port'],e['public_url']); sslopt=''
+        else:
+            mode='tcp'; bind=f'bind *:{p}'; redirect_rules=''; sslopt=''
+        if mode=='tcp' and sslopt:
+            raise ValueError('Configuración WEB inválida: mode tcp no puede combinarse con TLS en el backend')
+        cfg+=f'frontend {name}\n    {bind}\n    mode {mode}\n{redirect_rules}    default_backend {name}_backend\n\nbackend {name}_backend\n    mode {mode}\n    server target {web_backend_target(plant,e)}{sslopt}\n\n'
     return cfg, sorted(set(exposed))
 def update_webfix_compose_text(text, slug, enabled):
     service_re=rf"\n  webfix-{re.escape(slug)}:\n(?:(?!\n  [A-Za-z0-9_-]+:\n|\nnetworks:\n).)*"
@@ -2127,7 +2208,7 @@ def update_compose_ports_text(txt,ports):
   block='    ports:\n'+''.join(f'      - 0.0.0.0:{port}:{port}\n' for port in ports);marker='    cap_add:\n      - NET_ADMIN\n';txt=txt.replace(marker,marker+block,1) if marker in txt else txt.replace('    restart: unless-stopped\n','    restart: unless-stopped\n'+block,1)
  return txt
 def update_compose_ports(sl,ports):
- p=f'{BASE}/sites/{sl}/compose.yml'
+ p=plant_artifact_dir(BASE,sl)/'compose.yml'
  with open(p,encoding='utf-8') as fh:txt=fh.read()
  with open(p,'w',encoding='utf-8') as fh:fh.write(update_compose_ports_text(txt,ports))
 def publish_plant(plant):
@@ -2137,7 +2218,7 @@ def publish_plant(plant):
 def _publish_plant_locked(plant):
  v=vpn_for_plant(plant)
  if not v:raise Exception(f'No hay VPN activa para la planta {plant}')
- sl=v['slug'];config_dir=f'{BASE}/configs/{sl}';compose_path=f'{BASE}/sites/{sl}/compose.yml';haproxy_path=f'{config_dir}/haproxy.cfg';webfix_path=f'{config_dir}/webfix.conf'
+ sl=v['slug'];config_dir=f'{BASE}/configs/{sl}';compose_path=str(plant_artifact_dir(BASE,sl)/'compose.yml');haproxy_path=f'{config_dir}/haproxy.cfg';webfix_path=f'{config_dir}/webfix.conf'
  if not os.path.isfile(compose_path):raise Exception('Falta el Compose propietario de la VPN activa.')
  current=db().execute("SELECT active,onboarding_state,onboarding_revision FROM vpns WHERE id=?",(v['id'],)).fetchone() if 'id' in v else None
  if 'id' in v and (not current or not int(current['active'] or 0) or current['onboarding_state'] not in {'active','online'}):raise Exception('La VPN dejó de estar activa antes de publicar.')
@@ -2217,7 +2298,7 @@ def eqnew():
         except ValueError as ex: flash(str(ex)); return page('Añadir equipo',ef(form,rdp_import=True,locked_plant=locked or None)),400
         conn=db();conn.execute('SAVEPOINT equipment_create')
         try:
-            conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],f['public_url'],f['description'],1,datetime.now().isoformat(timespec='seconds'),f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port']))
+            conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port,web_bridge_host) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],f['public_url'],f['description'],1,datetime.now().isoformat(timespec='seconds'),f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host']))
             if f['kind'] in {'RDP','VNC'}:conn.execute('UPDATE equipment SET public_url=? WHERE id=?',(f"/equipment/{eid}/{f['kind'].lower()}",eid))
             set_equipment_tags(conn,eid,f['tags']);ports=publish_plant(f['plant']);conn.execute('RELEASE SAVEPOINT equipment_create');conn.commit();flash('Equipo guardado y acceso aplicado. '+(f"Diagnóstico WEB: {f['web_diagnostic']}. " if f['kind']=='WEB' else '')+'Puertos WEB publicados: '+(', '.join(map(str,ports)) if ports else 'ninguno'))
         except Exception as ex:
@@ -2244,7 +2325,7 @@ def eqedit(i):
         public_url=f"/equipment/{i}/{f['kind'].lower()}" if f['kind'] in {'RDP','VNC'} else f['public_url']
         conn=db();conn.execute('SAVEPOINT equipment_edit')
         try:
-            conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=? WHERE id=?',(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],i));set_equipment_tags(conn,i,f['tags'])
+            conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=?,web_bridge_host=? WHERE id=?',(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'],i));set_equipment_tags(conn,i,f['tags'])
             if oldplant!=f['plant']:publish_plant(oldplant)
             ports=publish_plant(f['plant']);conn.execute('RELEASE SAVEPOINT equipment_edit');conn.commit();flash('Equipo actualizado y acceso aplicado. '+(f"Diagnóstico WEB: {f['web_diagnostic']}. " if f['kind']=='WEB' else '')+'Puertos WEB publicados: '+(', '.join(map(str,ports)) if ports else 'ninguno'))
         except Exception as ex:
