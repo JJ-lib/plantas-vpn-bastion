@@ -4,7 +4,7 @@ import fcntl,functools
 import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json, hmac, stat
 from urllib.parse import quote, urlsplit
 from datetime import datetime
-from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messages,Response,has_request_context,jsonify
+from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messages,Response,has_request_context,has_app_context,jsonify
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
@@ -322,7 +322,7 @@ def init():
         c.execute('UPDATE tags SET sort_order=? WHERE name=?',(sort_order,name))
     cols=[r[1] for r in c.execute('PRAGMA table_info(equipment)').fetchall()]
     if 'vpn_id' not in cols: c.execute('ALTER TABLE equipment ADD COLUMN vpn_id INTEGER')
-    for name,typ in {'proxy_port':'INTEGER','rdp_username_enc':'TEXT','rdp_password_enc':'TEXT','rdp_domain_enc':'TEXT','rdp_remote_app':'TEXT','vnc_password_enc':'TEXT','vnc_read_only':'INTEGER DEFAULT 0','web_mode':"TEXT DEFAULT 'auto'",'web_effective_mode':"TEXT DEFAULT 'direct'",'web_diagnostic':"TEXT DEFAULT ''",'web_proxy_port':'INTEGER','web_bridge_host':"TEXT DEFAULT ''"}.items():
+    for name,typ in {'proxy_port':'INTEGER','rdp_username_enc':'TEXT','rdp_password_enc':'TEXT','rdp_domain_enc':'TEXT','rdp_remote_app':'TEXT','vnc_password_enc':'TEXT','vnc_read_only':'INTEGER DEFAULT 0','web_mode':"TEXT DEFAULT 'auto'",'web_effective_mode':"TEXT DEFAULT 'direct'",'web_diagnostic':"TEXT DEFAULT ''",'web_proxy_port':'INTEGER','web_bridge_host':"TEXT DEFAULT ''",'web_upstream_scheme':"TEXT DEFAULT ''",'web_upstream_host':"TEXT DEFAULT ''",'web_validation_profile':"TEXT DEFAULT ''",'web_validation_state':"TEXT DEFAULT 'pending'"}.items():
         if name not in cols: c.execute(f'ALTER TABLE equipment ADD COLUMN {name} {typ}')
     vcols=[r[1] for r in c.execute('PRAGMA table_info(vpns)').fetchall()]
     extra_cols={
@@ -1783,9 +1783,9 @@ def equipment_bulk_import(plant):
         now=datetime.now().isoformat(timespec='seconds')
         for eid,f,old in finalized:
             public_url=f'/equipment/{eid}/{f["kind"].lower()}' if f['kind'] in {'RDP','VNC'} else f['public_url']
-            values=(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'])
-            if old: conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=?,web_bridge_host=? WHERE id=?',values+(eid,))
-            else: conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port,web_bridge_host) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,)+values[:8]+(1,now)+values[8:])
+            values=(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'],f['web_upstream_scheme'],f['web_upstream_host'],f['web_validation_profile'],f['web_validation_state'])
+            if old: conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=?,web_bridge_host=?,web_upstream_scheme=?,web_upstream_host=?,web_validation_profile=?,web_validation_state=? WHERE id=?',values+(eid,))
+            else: conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port,web_bridge_host,web_upstream_scheme,web_upstream_host,web_validation_profile,web_validation_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,)+values[:8]+(1,now)+values[8:])
             set_equipment_tags(conn,eid,f['tags'])
         ports=publish_plant(plant)
         if batch_token: conn.execute('DELETE FROM equipment_import_batches WHERE token=?',(batch_token,))
@@ -1826,7 +1826,7 @@ def next_public_port():
     p=8081
     while p in used: p+=1
     return p
-def ef(e=None, rdp_import=False, locked_plant=None):
+def ef(e=None, rdp_import=False, locked_plant=None, minimal_web_onboarding=False):
     e=dict(e) if e else {'kind':'WEB','active':1,'plant':''}
     import_field="<label>Importar archivo .RDP</label><input name='rdp_file' type='file' accept='.rdp,application/octet-stream'><p class='muted'>Seleccione la planta y cargue el .RDP: al guardar se extraen el host, puerto, nombre y alias RemoteApp. Las credenciales se mantienen en el panel.</p>" if rdp_import else ''
     esc=lambda v: html.escape(str(v or ''),quote=True)
@@ -1836,6 +1836,15 @@ def ef(e=None, rdp_import=False, locked_plant=None):
     if locked_plant:
         locked_plant=locked_plant.strip(); plant_field=f"<label>Planta</label><div class='card'><strong>{esc(locked_plant)}</strong></div><input type='hidden' name='plant' value='{esc(locked_plant)}'>"
     else: plant_field=f"<label>Planta</label><select name='plant' required>{popts}</select>"
+    if minimal_web_onboarding and kind=='WEB':
+        return f"""<form class='card' method='post' id='equipment-form'>
+{plant_field}
+<input type='hidden' name='kind' value='WEB'>
+<label>Nombre</label><input name='name' value='{esc(e.get('name'))}' required>
+<label>IP real del equipo</label><input name='real_ip' value='{esc(e.get('real_ip'))}' required>
+<label>Puerto real</label><input name='real_port' id='real-port' value='{esc(e.get('real_port'))}' placeholder='80/443' required>
+<p class='muted'>El sistema probará HTTP, HTTPS y Host/SNI automáticamente. Publicará una URL HTTPS uniforme y no guardará el alta si no puede validar el equipo.</p>
+<button class='btn primary'>Detectar, validar y publicar</button></form>"""
     pub_port=e.get('proxy_port') or public_port_from_url(e.get('public_url','')) or ''
     web_mode=e.get('web_mode') if e.get('web_mode') in WEB_MODES else 'auto'
     web_mode_options=[('auto','Automático (recomendado)'),('direct','Directo'),('rewrite_cache','Reescritura y caché'),('bridge_tls','Bridge TLS (HTTPS en el frontal)')]
@@ -1902,15 +1911,36 @@ def imported_rdp_form(form, upload):
     values.update(parse_rdp_content(upload.read(65537)))
     return values
 
+def web_onboarding_profile(plant):
+    """Return the explicit WEB onboarding profile for one plant.
+
+    Missing or unknown profiles intentionally remain legacy so a new pilot can
+    be enabled by one scoped database value without changing other plants.
+    """
+    if not has_app_context():
+        return 'legacy',''
+    row=db().execute("SELECT web_onboarding_profile,web_default_host FROM vpns WHERE lower(trim(plant))=lower(trim(?)) ORDER BY id LIMIT 1",(str(plant or ''),)).fetchone()
+    if not row:
+        return 'legacy',''
+    profile=str(row['web_onboarding_profile'] or 'legacy').strip().lower()
+    if profile!='minimal_auto':
+        profile='legacy'
+    return profile,str(row['web_default_host'] or '').strip().lower().rstrip('.')
+
+def web_onboarding_enabled(plant):
+    return web_onboarding_profile(plant)[0]=='minimal_auto'
+
 def equipment_values(f, old=None):
     old=dict(old) if old else {}
     kind=(f.get('kind') or 'WEB').upper()
     if kind not in {'WEB','RDP','VNC'}: raise ValueError('El tipo de equipo debe ser WEB, RDP o VNC')
-    web_mode=(f.get('web_mode') or old.get('web_mode') or 'auto').strip().lower() if kind=='WEB' else 'direct'
+    plant=(f.get('plant') or '').strip(); name=(f.get('name') or '').strip(); real_ip=(f.get('real_ip') or '').strip()
+    requested_web_mode=(f.get('web_mode') or '').strip().lower() if kind=='WEB' else 'direct'
+    if kind=='WEB' and not requested_web_mode and web_onboarding_enabled(plant): requested_web_mode='bridge_tls'
+    web_mode=(requested_web_mode or old.get('web_mode') or 'auto') if kind=='WEB' else 'direct'
     if web_mode not in WEB_MODES: raise ValueError('El tratamiento web debe ser automático, directo, reescritura y caché o bridge TLS')
     web_bridge_host=(f.get('web_bridge_host') or old.get('web_bridge_host') or '').strip() if kind=='WEB' and web_mode=='bridge_tls' else ''
-    if web_mode=='bridge_tls': web_bridge_host=normalize_web_bridge_host(web_bridge_host)
-    plant=(f.get('plant') or '').strip(); name=(f.get('name') or '').strip(); real_ip=(f.get('real_ip') or '').strip()
+    if web_mode=='bridge_tls' and web_bridge_host: web_bridge_host=normalize_web_bridge_host(web_bridge_host)
     if not plant or not name or not real_ip: raise ValueError('Planta, nombre e IP real son obligatorios')
     tags=normalize_equipment_tags(f.get('tags',[]))
     default_port='80' if kind=='WEB' else ('3389' if kind=='RDP' else '5900')
@@ -1927,7 +1957,7 @@ def equipment_values(f, old=None):
         if bool(user_enc) != bool(pass_enc): raise ValueError('Para RDP indique usuario y contraseña, o deje ambos vacíos')
         if len(remote_app)>255 or any(ord(ch)<32 for ch in remote_app): raise ValueError('Alias RemoteApp inválido')
         remote_app=remote_app[2:] if remote_app.startswith('||') else remote_app
-        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,web_bridge_host='',rdp_username_enc=user_enc,rdp_password_enc=pass_enc,rdp_domain_enc=domain_enc,rdp_remote_app=remote_app,vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
+        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,web_bridge_host='',web_upstream_scheme='',web_upstream_host='',web_validation_profile='',web_validation_state='not_applicable',rdp_username_enc=user_enc,rdp_password_enc=pass_enc,rdp_domain_enc=domain_enc,rdp_remote_app=remote_app,vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
     if kind=='VNC':
         vpass=f.get('vnc_password') or ''
         imported_enc=(f.get('vnc_password_enc') or '').strip()
@@ -1937,7 +1967,7 @@ def equipment_values(f, old=None):
         else:
             pass_enc=enc(vpass) if vpass else old.get('vnc_password_enc','')
         read_only=1 if str(f.get('vnc_read_only') or '').lower() in {'1','true','on','yes'} else 0
-        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,web_bridge_host='',rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc=pass_enc,vnc_read_only=read_only,description=f.get('description',''),tags=tags)
+        return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path='',public_url='',proxy_port=proxy_port,web_mode=web_mode,web_bridge_host='',web_upstream_scheme='',web_upstream_host='',web_validation_profile='',web_validation_state='not_applicable',rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc=pass_enc,vnc_read_only=read_only,description=f.get('description',''),tags=tags)
     path=(f.get('path') or '/').strip()
     pub_url=(f.get('public_url') or '').strip()
     if not pub_url:
@@ -1952,7 +1982,7 @@ def equipment_values(f, old=None):
     if web_mode=='bridge_tls':
         parsed=urlsplit(pub_url)
         if parsed.scheme.lower()!='https' or not parsed.netloc: raise ValueError('El bridge TLS requiere una URL pública HTTPS')
-    return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path=path,public_url=pub_url,proxy_port=proxy_port,web_mode=web_mode,web_bridge_host=web_bridge_host,rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
+    return dict(plant=plant,name=name,kind=kind,real_ip=real_ip,real_port=real_port,path=path,public_url=pub_url,proxy_port=proxy_port,web_mode=web_mode,web_bridge_host=web_bridge_host,web_upstream_scheme='',web_upstream_host='',web_validation_profile='',web_validation_state='pending',rdp_username_enc='',rdp_password_enc='',rdp_domain_enc='',rdp_remote_app='',vnc_password_enc='',vnc_read_only=0,description=f.get('description',''),tags=tags)
 def equipment_ip_key(value):
     value=str(value or '').strip()
     try: return ipaddress.ip_address(value).compressed.casefold()
@@ -2045,30 +2075,111 @@ def web_redirect_rules(real_ip, real_port, public_url):
             f"    http-response replace-header Location ^https?://{target}(?::{port})?(/.*)?$ {scheme}://%[var(txn.public_host)]\\1\n"
             )
 
-def bridge_tls_redirect_rules(bridge_host, real_port):
-    host=normalize_web_bridge_host(bridge_host)
-    target=re.escape(host); port=re.escape(str(real_port))
+def bridge_tls_redirect_rules(bridge_host, real_port, real_ip='', public_url=''):
+    host=str(bridge_host or '').strip()
+    target_host=normalize_web_bridge_host(host) if host else ''
+    target=re.escape(target_host or str(real_ip or ''))
+    port=re.escape(str(real_port))
+    host_line=f"    http-request set-header Host {target_host}\n" if target_host else ''
     return ("    http-request set-var(txn.public_host) req.hdr(Host)\n"
-            f"    http-request set-header Host {host}\n"
             "    http-request set-header X-Forwarded-Proto https\n"
-            f"    http-response replace-header Location ^https?://{target}(?::{port})?(/.*)?$ https://%[var(txn.public_host)]\\1\n"
-            )
+            +host_line+
+            f"    http-response replace-header Location ^https?://{target}(?::{port})?(/.*)?$ https://%[var(txn.public_host)]\\1\n")
 
 def finalize_web_settings(values, equipment_id, old=None):
+    has_old=old is not None
     result=dict(values); old=dict(old) if old else {}
+    result.setdefault('web_upstream_scheme',old.get('web_upstream_scheme',''))
+    result.setdefault('web_upstream_host',old.get('web_upstream_host',''))
+    result.setdefault('web_validation_profile',old.get('web_validation_profile',''))
+    result.setdefault('web_validation_state',old.get('web_validation_state','pending'))
     if result['kind']!='WEB':
-        result.update(web_effective_mode='direct',web_diagnostic='',web_proxy_port=None,web_bridge_host=''); return result
-    if result.get('web_mode')=='bridge_tls':
-        result['web_bridge_host']=normalize_web_bridge_host(result.get('web_bridge_host') or old.get('web_bridge_host'))
+        result.update(web_effective_mode='direct',web_diagnostic='',web_proxy_port=None,web_bridge_host='',web_upstream_scheme='',web_upstream_host='',web_validation_profile='',web_validation_state='not_applicable'); return result
+    profile,default_host=web_onboarding_profile(result['plant'])
+    is_new_minimal=not has_old and profile=='minimal_auto'
     vpn=vpn_for_plant(result['plant'])
     if not vpn: raise ValueError(f"No hay VPN configurada para la planta {result['plant']}")
+    if is_new_minimal:
+        analysis=probe_web_equipment_auto(vpn['slug'],result['real_ip'],result['real_port'],default_host)
+        if analysis.get('profile')=='unreachable':
+            raise ValueError('No se pudo validar el equipo WEB: '+str(analysis.get('diagnostic') or 'sin respuesta'))
+        if analysis.get('upstream_scheme') not in {'http','https'}:
+            raise ValueError('El equipo WEB no devolvió una respuesta HTTP/HTTPS válida.')
+        bridge_host=analysis.get('upstream_host') or ''
+        result.update(web_mode='bridge_tls',web_effective_mode='bridge_tls',web_diagnostic=analysis.get('diagnostic') or 'Protocolo detectado automáticamente',web_proxy_port=None,web_bridge_host=bridge_host,web_upstream_scheme=analysis['upstream_scheme'],web_upstream_host=bridge_host,web_validation_profile=analysis['profile'],web_validation_state='validated')
+        return result
+    if result.get('web_mode')=='bridge_tls':
+        bridge_host=result.get('web_bridge_host') or old.get('web_bridge_host') or ''
+        result['web_bridge_host']=normalize_web_bridge_host(bridge_host) if bridge_host else ''
     analysis=probe_web_equipment(vpn['slug'],result['real_ip'],result['real_port'],result['web_mode'])
     listener=None
     if analysis['effective_mode']=='rewrite_cache':
         listener=old.get('web_proxy_port') or (18000+int(equipment_id))
         if int(listener)>65535: raise ValueError('No quedan listeners internos disponibles para el proxy WEB')
-    result.update(web_effective_mode=analysis['effective_mode'],web_diagnostic=analysis['diagnostic'],web_proxy_port=listener)
+    upstream_scheme=old.get('web_upstream_scheme') or ('https' if result['web_mode']=='bridge_tls' and str(result['real_port'])=='443' else '')
+    upstream_host=old.get('web_upstream_host') or result.get('web_bridge_host','')
+    result.update(web_effective_mode=analysis['effective_mode'],web_diagnostic=analysis['diagnostic'],web_proxy_port=listener,web_upstream_scheme=upstream_scheme,web_upstream_host=upstream_host,web_validation_profile=old.get('web_validation_profile','legacy'),web_validation_state=old.get('web_validation_state','manual'))
     return result
+
+def _web_probe_usable(result):
+    if getattr(result,'returncode',1)!=0:
+        return False
+    output=str(getattr(result,'stdout','') or '')
+    statuses=[int(value) for value in re.findall(r'HTTP/\d(?:\.\d)?\s+(\d{3})',output,re.I)]
+    if not statuses:
+        return bool(output.strip())
+    return 100<=statuses[-1]<500
+
+def _web_probe_status(result):
+    statuses=[int(value) for value in re.findall(r'HTTP/\d(?:\.\d)?\s+(\d{3})',str(getattr(result,'stdout','') or ''),re.I)]
+    return statuses[-1] if statuses else None
+
+def _web_probe_http_usable(result):
+    if not _web_probe_usable(result):
+        return False
+    status=_web_probe_status(result)
+    return status is None or status not in {400,421,495,496,497}
+
+def probe_web_equipment_auto(slug, real_ip, real_port, default_host='', runner=subprocess.run):
+    """Probe an internal WEB target and return a publication-safe classification."""
+    ip=str(real_ip or '').strip(); port=str(real_port or '').strip()
+    if not ip or not port.isdigit() or not 1<=int(port)<=65535 or any(ord(ch)<33 or ord(ch)==127 for ch in ip):
+        return {'profile':'unreachable','upstream_scheme':'','upstream_host':'','diagnostic':'Destino WEB inválido'}
+    host=str(default_host or '').strip().lower().rstrip('.')
+    if host:
+        try: host=normalize_web_bridge_host(host)
+        except ValueError: host=''
+    base=['docker','exec',f'vpn-{slug}','curl','-k','-sS','--http1.1','--connect-timeout','5','--max-time','15','-D','-','-o','-','--range','0-262144']
+    def attempt(url,connect_to=None):
+        command=list(base)
+        if connect_to: command.extend(['--connect-to',connect_to])
+        command.append(url)
+        try:
+            return runner(command,text=True,capture_output=True,timeout=30)
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            class Failed:
+                returncode=1; stdout=''; stderr=type(exc).__name__
+            return Failed()
+    http=attempt(f'http://{ip}:{port}/')
+    if _web_probe_http_usable(http):
+        status=_web_probe_status(http)
+        return {'profile':'generic_http','upstream_scheme':'http','upstream_host':'','status':status,'diagnostic':f'HTTP interno detectado{(" · HTTP "+str(status)) if status else ""}'}
+    https=attempt(f'https://{ip}:{port}/')
+    https_usable=_web_probe_usable(https)
+    https_status=_web_probe_status(https)
+    host_sensitive=https_status in {400,404,421,495,496,497}
+    if https_usable and (not host or not host_sensitive):
+        return {'profile':'generic_https','upstream_scheme':'https','upstream_host':'','status':https_status,'diagnostic':f'HTTPS interno detectado{(" · HTTP "+str(https_status)) if https_status else ""}'}
+    if host:
+        host_https=attempt(f'https://{host}:{port}/',f'{host}:{port}:{ip}:{port}')
+        if _web_probe_usable(host_https):
+            status=_web_probe_status(host_https)
+            return {'profile':'plant_host_https','upstream_scheme':'https','upstream_host':host,'status':status,'diagnostic':f'HTTPS interno requiere Host/SNI {host}'}
+    if https_usable:
+        return {'profile':'generic_https','upstream_scheme':'https','upstream_host':'','status':https_status,'diagnostic':f'HTTPS interno detectado{(" · HTTP "+str(https_status)) if https_status else ""}'}
+    status=https_status or _web_probe_status(http)
+    suffix=f' · último estado HTTP {status}' if status else ''
+    return {'profile':'unreachable','upstream_scheme':'','upstream_host':'','status':status,'diagnostic':f'El equipo no respondió por HTTP ni HTTPS{suffix}'}
 
 def probe_web_equipment(slug, real_ip, real_port, requested_mode, runner=subprocess.run):
     if requested_mode in {'direct','rewrite_cache','bridge_tls'}:
@@ -2164,10 +2275,13 @@ def render_haproxy_for_plant(plant):
         else: effective='direct'
         name=re.sub('[^a-zA-Z0-9_]+','_',f"{e['plant']}_{e['name']}_{e['id']}").lower()
         if e['kind']=='WEB' and effective=='bridge_tls':
-            bridge_host=normalize_web_bridge_host(e['web_bridge_host'])
+            bridge_host=str(row_value(e,'web_bridge_host','') or '').strip()
+            upstream_host=str(row_value(e,'web_upstream_host','') or '').strip() or bridge_host
+            upstream_scheme=str(row_value(e,'web_upstream_scheme','') or '').strip().lower() or ('https' if str(e['real_port'])=='443' else 'http')
+            if upstream_scheme not in {'http','https'}: raise ValueError(f"Esquema upstream WEB no válido para el equipo {e['id']}")
             mode='http'; bind=f'bind *:{p} ssl crt {BRIDGE_TLS_CERT}'
-            redirect_rules=bridge_tls_redirect_rules(bridge_host,e['real_port'])
-            sslopt=f' ssl verify none sni str({bridge_host}) ciphers {BRIDGE_TLS_CIPHERS}'
+            redirect_rules=bridge_tls_redirect_rules(upstream_host,e['real_port'],e['real_ip'],e['public_url'])
+            sslopt=(f' ssl verify none sni str({upstream_host}) ciphers {BRIDGE_TLS_CIPHERS}' if upstream_scheme=='https' and upstream_host else (f' ssl verify none ciphers {BRIDGE_TLS_CIPHERS}' if upstream_scheme=='https' else ''))
         elif e['kind']=='WEB' and effective=='direct':
             mode='tcp'; bind=f'bind *:{p}'; redirect_rules=''; sslopt=''
         elif e['kind']=='WEB':
@@ -2283,6 +2397,7 @@ def _publish_plant_locked(plant):
 def eqnew():
     locked_raw=(request.args.get('plant') or '').strip();locked=canonical_plant_name(locked_raw) if locked_raw else ''
     if locked_raw and not locked: abort(404)
+    minimal_web=bool(locked and web_onboarding_enabled(locked))
     if request.method=='POST':
         form=request.form.to_dict();form['tags']=request.form.getlist('tags')
         if locked: form['plant']=locked
@@ -2295,19 +2410,19 @@ def eqnew():
             f=equipment_values(form)
             eid=db().execute('SELECT COALESCE(MAX(id),0)+1 FROM equipment').fetchone()[0]
             f=finalize_web_settings(f,eid)
-        except ValueError as ex: flash(str(ex)); return page('Añadir equipo',ef(form,rdp_import=True,locked_plant=locked or None)),400
+        except ValueError as ex: flash(str(ex)); return page('Añadir equipo',ef(form,rdp_import=True,locked_plant=locked or None,minimal_web_onboarding=minimal_web)),400
         conn=db();conn.execute('SAVEPOINT equipment_create')
         try:
-            conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port,web_bridge_host) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],f['public_url'],f['description'],1,datetime.now().isoformat(timespec='seconds'),f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host']))
+            conn.execute('INSERT INTO equipment(id,plant,name,kind,real_ip,real_port,path,public_url,description,active,created_at,proxy_port,rdp_username_enc,rdp_password_enc,rdp_domain_enc,rdp_remote_app,vnc_password_enc,vnc_read_only,web_mode,web_effective_mode,web_diagnostic,web_proxy_port,web_bridge_host,web_upstream_scheme,web_upstream_host,web_validation_profile,web_validation_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],f['public_url'],f['description'],1,datetime.now().isoformat(timespec='seconds'),f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'],f['web_upstream_scheme'],f['web_upstream_host'],f['web_validation_profile'],f['web_validation_state']))
             if f['kind'] in {'RDP','VNC'}:conn.execute('UPDATE equipment SET public_url=? WHERE id=?',(f"/equipment/{eid}/{f['kind'].lower()}",eid))
             set_equipment_tags(conn,eid,f['tags']);ports=publish_plant(f['plant']);conn.execute('RELEASE SAVEPOINT equipment_create');conn.commit();flash('Equipo guardado y acceso aplicado. '+(f"Diagnóstico WEB: {f['web_diagnostic']}. " if f['kind']=='WEB' else '')+'Puertos WEB publicados: '+(', '.join(map(str,ports)) if ports else 'ninguno'))
         except Exception as ex:
             try:conn.execute('ROLLBACK TO SAVEPOINT equipment_create');conn.execute('RELEASE SAVEPOINT equipment_create');conn.commit()
             except Exception:conn.rollback()
-            flash('No se guardó el equipo porque la publicación falló: '+str(ex));return page('Añadir equipo',ef(form,rdp_import=True,locked_plant=locked or None)),500
+            flash('No se guardó el equipo porque la publicación falló: '+str(ex));return page('Añadir equipo',ef(form,rdp_import=True,locked_plant=locked or None,minimal_web_onboarding=minimal_web)),500
         return redirect('/admin/equipment/plant/'+quote(f['plant'],safe=''))
     initial={'plant':locked} if locked else None
-    return page('Añadir equipo',ef(initial,rdp_import=True,locked_plant=locked or None))
+    return page('Añadir equipo',ef(initial,rdp_import=True,locked_plant=locked or None,minimal_web_onboarding=minimal_web))
 
 @app.route('/admin/equipment/<int:i>/edit',methods=['GET','POST'])
 @admin
@@ -2325,7 +2440,7 @@ def eqedit(i):
         public_url=f"/equipment/{i}/{f['kind'].lower()}" if f['kind'] in {'RDP','VNC'} else f['public_url']
         conn=db();conn.execute('SAVEPOINT equipment_edit')
         try:
-            conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=?,web_bridge_host=? WHERE id=?',(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'],i));set_equipment_tags(conn,i,f['tags'])
+            conn.execute('UPDATE equipment SET plant=?,name=?,kind=?,real_ip=?,real_port=?,path=?,public_url=?,description=?,proxy_port=?,rdp_username_enc=?,rdp_password_enc=?,rdp_domain_enc=?,rdp_remote_app=?,vnc_password_enc=?,vnc_read_only=?,web_mode=?,web_effective_mode=?,web_diagnostic=?,web_proxy_port=?,web_bridge_host=?,web_upstream_scheme=?,web_upstream_host=?,web_validation_profile=?,web_validation_state=? WHERE id=?',(f['plant'],f['name'],f['kind'],f['real_ip'],f['real_port'],f['path'],public_url,f['description'],f['proxy_port'],f['rdp_username_enc'],f['rdp_password_enc'],f['rdp_domain_enc'],f['rdp_remote_app'],f['vnc_password_enc'],f['vnc_read_only'],f['web_mode'],f['web_effective_mode'],f['web_diagnostic'],f['web_proxy_port'],f['web_bridge_host'],f['web_upstream_scheme'],f['web_upstream_host'],f['web_validation_profile'],f['web_validation_state'],i));set_equipment_tags(conn,i,f['tags'])
             if oldplant!=f['plant']:publish_plant(oldplant)
             ports=publish_plant(f['plant']);conn.execute('RELEASE SAVEPOINT equipment_edit');conn.commit();flash('Equipo actualizado y acceso aplicado. '+(f"Diagnóstico WEB: {f['web_diagnostic']}. " if f['kind']=='WEB' else '')+'Puertos WEB publicados: '+(', '.join(map(str,ports)) if ports else 'ninguno'))
         except Exception as ex:
