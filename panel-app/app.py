@@ -14,7 +14,25 @@ from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_
 from plant_paths import plant_artifact_dir
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
 DB=os.environ.get('PANEL_DB',os.path.join(DATA_DIR,'panel.db')); BASE=os.environ.get('PROJECT_DIR','/opt/bastion-vpn')
-PUBLIC_ORIGIN=os.environ.get('BASTION_PUBLIC_ORIGIN','http://127.0.0.1').rstrip('/')
+PUBLIC_ORIGIN=os.environ.get('BASTION_PUBLIC_ORIGIN','').strip().rstrip('/')
+LOOPBACK_PUBLIC_HOSTS={'127.0.0.1','localhost','::1'}
+def configured_public_origin(require_https=False):
+    raw=PUBLIC_ORIGIN
+    origin=urlsplit(raw)
+    try:
+        origin_port=origin.port
+        invalid_port=False
+    except ValueError:
+        origin_port=None
+        invalid_port=True
+    host=(origin.hostname or '').strip().lower().rstrip('.')
+    if (origin.scheme.lower() not in {'http','https'} or not origin.netloc or not host
+            or origin.username or origin.password or invalid_port or origin_port is not None
+            or origin.path not in {'','/'} or origin.query or origin.fragment
+            or host in LOOPBACK_PUBLIC_HOSTS
+            or (require_https and origin.scheme.lower()!='https')):
+        raise ValueError('El origen público HTTPS del bridge TLS no está configurado o apunta a loopback.')
+    return origin
 DEFAULT_VALIDATION_DENY_CIDRS=('127.0.0.0/8','169.254.0.0/16','100.64.0.0/10')
 def validation_deny_networks():
     raw=os.environ.get('VALIDATION_DENY_CIDRS',' '.join(DEFAULT_VALIDATION_DENY_CIDRS))
@@ -1974,11 +1992,11 @@ def equipment_values(f, old=None):
         suffix=path if path else '/'
         if not suffix.startswith('/'): suffix='/'+suffix
         if web_mode=='bridge_tls':
-            origin=urlsplit(PUBLIC_ORIGIN)
-            if not origin.netloc: raise ValueError('No se pudo construir la URL pública HTTPS del bridge TLS')
+            origin=configured_public_origin(require_https=True)
             pub_url=f'https://{origin.netloc}:{proxy_port}{suffix}'
         else:
-            pub_url=f'{PUBLIC_ORIGIN}:{proxy_port}{suffix}'
+            origin=configured_public_origin()
+            pub_url=f'{origin.geturl().rstrip("/")}:{proxy_port}{suffix}'
     if web_mode=='bridge_tls':
         parsed=urlsplit(pub_url)
         if parsed.scheme.lower()!='https' or not parsed.netloc: raise ValueError('El bridge TLS requiere una URL pública HTTPS')

@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class CabrovalesWebOnboardingTest(unittest.TestCase):
@@ -14,6 +15,7 @@ class CabrovalesWebOnboardingTest(unittest.TestCase):
         os.environ["PANEL_DB"] = str(root / "data" / "panel.db")
         os.environ["PROJECT_DIR"] = str(root)
         os.environ["PANEL_BOOTSTRAP_ADMIN_PASSWORD"] = "cabrovales-web-test-password"
+        os.environ["BASTION_PUBLIC_ORIGIN"] = "https://192.0.2.1"
         (root / "configs").mkdir(parents=True, exist_ok=True)
         (root / "configs" / "bridge.pem").write_text("test-certificate\n")
         (root / "sites" / "cabrovales").mkdir(parents=True, exist_ok=True)
@@ -98,6 +100,21 @@ class CabrovalesWebOnboardingTest(unittest.TestCase):
         self.set_profile()
         with self.app.app.app_context():
             self.assertEqual(("minimal_auto", "local.domain"), self.app.web_onboarding_profile("CABROVALES"))
+
+    def test_bridge_rejects_loopback_public_origin(self):
+        self.set_profile()
+        with patch.object(self.app, "PUBLIC_ORIGIN", "https://127.0.0.1"):
+            with self.assertRaisesRegex(ValueError, "origen público"):
+                with self.app.app.app_context():
+                    self.app.equipment_values(
+                        {
+                            "plant": "CABROVALES",
+                            "name": "LOOPBACK WEB",
+                            "kind": "WEB",
+                            "real_ip": "192.0.2.10",
+                            "real_port": "443",
+                        }
+                    )
 
     def test_minimal_form_is_only_used_for_cabrovales_new_web(self):
         with self.app.app.app_context():

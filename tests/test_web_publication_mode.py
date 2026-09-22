@@ -3,7 +3,7 @@ from pathlib import Path
 class WebPublicationModeTest(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
-  cls.tmp=tempfile.TemporaryDirectory();os.environ["PANEL_DB"]=str(Path(cls.tmp.name)/"panel.db")
+  cls.tmp=tempfile.TemporaryDirectory();os.environ["PANEL_DB"]=str(Path(cls.tmp.name)/"panel.db");os.environ.setdefault("BASTION_PUBLIC_ORIGIN","https://192.0.2.1")
   spec=importlib.util.spec_from_file_location("panel_app_webmode",os.environ.get("PANEL_APP_UNDER_TEST",str(Path(__file__).resolve().parents[1] / "panel-app/app.py")));cls.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(cls.app)
  @classmethod
  def tearDownClass(cls): cls.tmp.cleanup()
