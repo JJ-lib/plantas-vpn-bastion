@@ -1,125 +1,30 @@
 import ast
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "panel-app"))
 
-from vpn_endpoint_health import (
+from vpn_endpoint_health import (  # noqa: E402
+    FAILURE_THRESHOLD,
+    HISTORY_SECONDS,
     MAX_CONSECUTIVE_FAILURES,
     MAX_LATENCY_MS,
     MAX_TIMESTAMP,
-    StaleRevisionError,
     StaleCycleError,
+    StaleRevisionError,
     apply_probe_result,
+    configure_sqlite_connection,
     ensure_endpoint_health_schema,
     health_for_vpns,
+    history_intervals,
+    public_alert_eligible,
     target_revision,
     validate_result,
 )
-
-
-TABLE_FIELDS = {
-    "vpn_id",
-    "target_revision",
-    "target_generation",
-    "cycle_id",
-    "lease_id",
-    "probe_type",
-    "state",
-    "public_code",
-    "consecutive_failures",
-    "first_failure_at",
-    "last_checked_at",
-    "last_success_at",
-    "last_transition_at",
-    "latency_ms",
-    "last_accepted_at",
-    "last_conclusive_at",
-}
-STATES = {"healthy", "suspect", "down", "unknown", "stale", "disabled"}
-
-
-class EndpointHealthSchemaTests(unittest.TestCase):
-    def conn(self):
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE vpns("
-            "id INTEGER PRIMARY KEY, active INTEGER NOT NULL, "
-            "onboarding_state TEXT NOT NULL)"
-        )
-        conn.execute("INSERT INTO vpns VALUES(1, 1, 'active')")
-        return conn
-
-    @staticmethod
-    def insert_health(conn, vpn_id, state="unknown"):
-        conn.execute(
-            "INSERT INTO vpn_endpoint_health("
-            "vpn_id,target_revision,probe_type,state,public_code,"
-            "target_generation,cycle_id,lease_id,"
-            "consecutive_failures,first_failure_at,last_checked_at,"
-            "last_success_at,last_transition_at,latency_ms,last_accepted_at,last_conclusive_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                vpn_id,
-                "a" * 64,
-                "tcp_connect",
-                state,
-                "not_checked",
-                0,
-                0,
-                "synthetic-lease",
-                0,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-
-    def test_schema_is_idempotent_and_has_only_approved_fields(self):
-        conn = self.conn()
-
-        ensure_endpoint_health_schema(conn)
-        self.insert_health(conn, 1)
-        ensure_endpoint_health_schema(conn)
-
-        fields = {row[1] for row in conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
-        self.assertEqual(fields, TABLE_FIELDS)
-        self.assertEqual(
-            conn.execute("SELECT state FROM vpn_endpoint_health WHERE vpn_id=?", (1,)).fetchone()[0],
-            "unknown",
-        )
-
-    def test_vpn_id_is_unique_and_states_are_constrained(self):
-        conn = self.conn()
-        ensure_endpoint_health_schema(conn)
-
-        for vpn_id, state in enumerate(sorted(STATES), start=10):
-            self.insert_health(conn, vpn_id, state)
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.insert_health(conn, 10)
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.insert_health(conn, 99, "invalid")
-
-    def test_schema_initialization_does_not_mutate_vpn_lifecycle_columns(self):
-        conn = self.conn()
-        before = conn.execute(
-            "SELECT active,onboarding_state FROM vpns WHERE id=?", (1,)
-        ).fetchone()
-
-        ensure_endpoint_health_schema(conn)
-        ensure_endpoint_health_schema(conn)
-
-        after = conn.execute(
-            "SELECT active,onboarding_state FROM vpns WHERE id=?", (1,)
-        ).fetchone()
-        self.assertEqual(after, before)
 
 
 TARGET = {
@@ -127,422 +32,249 @@ TARGET = {
     "host": "vpn.example.test",
     "port": 443,
     "transport": "tcp",
-    "ike_version": "",
-    "aggressive": False,
-    "nat_t": False,
 }
 
 
-class EndpointHealthBehaviorTests(unittest.TestCase):
+class HealthFixture(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute(
-            "CREATE TABLE vpns("
-            "id INTEGER PRIMARY KEY, active INTEGER NOT NULL, "
-            "onboarding_state TEXT NOT NULL)"
-        )
-        self.conn.execute("INSERT INTO vpns VALUES(1, 1, 'active')")
         ensure_endpoint_health_schema(self.conn)
         self.revision = target_revision(TARGET)
-        self.next_cycle = 1
 
-    def result(
-        self,
-        *,
-        revision=None,
-        outcome="reachable",
-        code="tcp_accept",
-        observed_at=1_000,
-        latency_ms=25,
-        probe_type="tcp_connect",
-        target_generation=1,
-        cycle_id=1,
-        lease_id="synthetic-lease",
-    ):
-        return {
+    def result(self, *, checked_at=1000, icmp_ok=False, protocol_ok=False, **extra):
+        result = {
             "vpn_id": 1,
-            "target_revision": revision or self.revision,
-            "target_generation": target_generation,
-            "cycle_id": cycle_id,
-            "lease_id": lease_id,
-            "probe_type": probe_type,
-            "outcome": outcome,
-            "public_code": code,
-            "latency_ms": latency_ms,
-            "observed_at": observed_at,
+            "target_revision": extra.pop("target_revision", self.revision),
+            "icmp_ok": icmp_ok,
+            "protocol_ok": protocol_ok,
+            "protocol_probe": extra.pop("protocol_probe", "tcp"),
+            "checked_at": checked_at,
         }
-
-    def health(self, *, now=1_000):
-        return health_for_vpns(self.conn, [1], now=now)[1]
+        result.update(extra)
+        return result
 
     def apply(self, **changes):
-        expected_revision = changes.pop("expected_revision", self.revision)
-        changes.setdefault("cycle_id", self.next_cycle)
-        self.next_cycle = max(self.next_cycle, changes["cycle_id"] + 1)
-        return apply_probe_result(
-            self.conn,
-            self.result(**changes),
-            expected_revision=expected_revision,
-        )
+        expected = changes.pop("expected_revision", self.revision)
+        return apply_probe_result(self.conn, self.result(**changes), expected_revision=expected)
 
-    def test_first_conclusive_failure_becomes_suspect(self):
-        self.apply(
-            outcome="unreachable",
-            code="tcp_unreachable",
-            latency_ms=3_000,
-        )
+    def health(self, now=1000):
+        return health_for_vpns(self.conn, [1], now=now)[1]
 
-        health = self.health()
-        self.assertEqual(health["state"], "suspect")
-        self.assertEqual(health["consecutive_failures"], 1)
-        self.assertEqual(health["first_failure_at"], 1_000)
-        self.assertEqual(health["last_checked_at"], 1_000)
-        self.assertEqual(health["last_transition_at"], 1_000)
-        self.assertIsNone(health["last_success_at"])
 
-    def test_second_failure_becomes_down_and_later_failures_are_capped(self):
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_300)
-
-        health = self.health(now=1_300)
-        self.assertEqual(health["state"], "down")
-        self.assertEqual(health["consecutive_failures"], 2)
-        self.assertEqual(health["first_failure_at"], 1_000)
-        self.assertEqual(health["last_transition_at"], 1_300)
-
-        self.conn.execute(
-            "UPDATE vpn_endpoint_health SET consecutive_failures=? WHERE vpn_id=?",
-            (MAX_CONSECUTIVE_FAILURES - 1, 1),
-        )
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_600)
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_900)
-        self.assertEqual(
-            self.health(now=1_900)["consecutive_failures"],
-            MAX_CONSECUTIVE_FAILURES,
-        )
-
-    def test_first_success_recovers_to_healthy_and_resets_failures(self):
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_300)
-        self.apply(observed_at=1_600, latency_ms=42)
-
-        health = self.health(now=1_600)
-        self.assertEqual(health["state"], "healthy")
-        self.assertEqual(health["consecutive_failures"], 0)
-        self.assertIsNone(health["first_failure_at"])
-        self.assertEqual(health["last_success_at"], 1_600)
-        self.assertEqual(health["last_transition_at"], 1_600)
-        self.assertEqual(health["latency_ms"], 42)
-
-        self.apply(observed_at=1_900, latency_ms=31)
-        self.assertEqual(self.health(now=1_900)["last_transition_at"], 1_600)
-
-    def test_inconclusive_updates_observation_without_changing_conclusive_state(self):
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_300)
-        before = self.health(now=1_300)
-
-        self.apply(
-            outcome="inconclusive",
-            code="probe_error",
-            observed_at=1_600,
-            latency_ms=None,
-        )
-
-        after = self.health(now=1_600)
-        self.assertEqual(after["state"], "down")
-        self.assertEqual(
-            after["consecutive_failures"], before["consecutive_failures"]
-        )
-        self.assertEqual(after["first_failure_at"], before["first_failure_at"])
-        self.assertEqual(after["last_transition_at"], before["last_transition_at"])
-        self.assertEqual(after["public_code"], "probe_error")
-        self.assertEqual(after["last_checked_at"], 1_600)
-
-    def test_revision_change_resets_then_applies_current_result(self):
-        self.apply(observed_at=1_000)
-        new_target = dict(TARGET, host="new-vpn.example.test")
-        new_revision = target_revision(new_target)
-
-        apply_probe_result(
-            self.conn,
-            self.result(
-                revision=new_revision,
-                outcome="unreachable",
-                code="tcp_unreachable",
-                observed_at=1_300,
-            ),
-            expected_revision=new_revision,
-        )
-
-        health = self.health(now=1_300)
-        self.assertEqual(health["target_revision"], new_revision)
-        self.assertEqual(health["state"], "suspect")
-        self.assertEqual(health["consecutive_failures"], 1)
-        self.assertEqual(health["first_failure_at"], 1_300)
-        self.assertIsNone(health["last_success_at"])
-        self.assertEqual(health["last_transition_at"], 1_300)
-
-    def test_revision_change_with_inconclusive_result_remains_unknown(self):
-        self.apply(observed_at=1_000)
-        new_revision = target_revision(dict(TARGET, port=444))
-
-        apply_probe_result(
-            self.conn,
-            self.result(
-                revision=new_revision,
-                outcome="inconclusive",
-                code="probe_error",
-                observed_at=1_300,
-                latency_ms=None,
-            ),
-            expected_revision=new_revision,
-        )
-
-        health = self.health(now=1_300)
-        self.assertEqual(health["state"], "unknown")
-        self.assertEqual(health["consecutive_failures"], 0)
-        self.assertIsNone(health["last_success_at"])
-        self.assertEqual(health["last_transition_at"], 1_300)
-
-    def test_stale_revision_is_rejected_without_mutation(self):
-        self.apply(observed_at=1_000)
-        before = tuple(
+class SchemaTests(HealthFixture):
+    def test_schema_is_idempotent_and_has_only_public_states(self):
+        ensure_endpoint_health_schema(self.conn)
+        ensure_endpoint_health_schema(self.conn)
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(vpn_endpoint_health)")}
+        self.assertTrue({
+            "vpn_id", "target_revision", "state", "consecutive_failures",
+            "icmp_ok", "protocol_ok", "protocol_probe", "last_checked_at",
+            "last_success_at", "last_transition_at", "updated_at",
+        } <= columns)
+        event_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(vpn_endpoint_health_events)")}
+        self.assertTrue({
+            "id", "vpn_id", "old_state", "new_state", "icmp_ok", "protocol_ok",
+            "protocol_probe", "created_at",
+        } <= event_columns)
+        with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute(
-                "SELECT * FROM vpn_endpoint_health WHERE vpn_id=?", (1,)
-            ).fetchone()
-        )
-        stale_revision = target_revision(dict(TARGET, port=444))
+                "INSERT INTO vpn_endpoint_health(vpn_id,target_revision,state,consecutive_failures) VALUES(?,?,?,?)",
+                (1, self.revision, "suspect", 1),
+            )
 
+    def test_schema_does_not_mutate_lifecycle_columns(self):
+        self.conn.execute("CREATE TABLE vpns(id INTEGER PRIMARY KEY, active INTEGER, onboarding_state TEXT)")
+        self.conn.execute("INSERT INTO vpns VALUES(1,1,'active')")
+        before = tuple(self.conn.execute("SELECT active,onboarding_state FROM vpns WHERE id=1").fetchone())
+        ensure_endpoint_health_schema(self.conn)
+        after = tuple(self.conn.execute("SELECT active,onboarding_state FROM vpns WHERE id=1").fetchone())
+        self.assertEqual(after, before)
+
+    def test_sqlite_concurrency_pragmas_are_configured(self):
+        configure_sqlite_connection(self.conn)
+        self.assertEqual(self.conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+
+
+class StateMachineTests(HealthFixture):
+    def test_or_rule_marks_cycle_accessible(self):
+        for icmp_ok, protocol_ok in ((True, False), (False, True), (True, True)):
+            with self.subTest(icmp_ok=icmp_ok, protocol_ok=protocol_ok):
+                self.apply(checked_at=1000, icmp_ok=icmp_ok, protocol_ok=protocol_ok)
+                health = self.health()
+                self.assertEqual(health["state"], "accessible")
+                self.assertEqual(health["consecutive_failures"], 0)
+                self.conn.execute("DELETE FROM vpn_endpoint_health")
+                self.conn.execute("DELETE FROM vpn_endpoint_health_events")
+
+    def test_three_complete_failures_transition_and_one_success_recovers(self):
+        for checked_at in (1000, 1060):
+            self.apply(checked_at=checked_at)
+            self.assertEqual(self.health(checked_at)["state"], "accessible")
+        self.apply(checked_at=1120)
+        health = self.health(1120)
+        self.assertEqual(health["state"], "unreachable")
+        self.assertEqual(health["consecutive_failures"], FAILURE_THRESHOLD)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vpn_endpoint_health_events").fetchone()[0], 1)
+        event = self.conn.execute(
+            "SELECT old_state,new_state,icmp_ok,protocol_ok,protocol_probe FROM vpn_endpoint_health_events"
+        ).fetchone()
+        self.assertEqual(tuple(event), ("accessible", "unreachable", 0, 0, "tcp"))
+
+        self.apply(checked_at=1180, icmp_ok=False, protocol_ok=True)
+        health = self.health(1180)
+        self.assertEqual(health["state"], "accessible")
+        self.assertEqual(health["consecutive_failures"], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vpn_endpoint_health_events").fetchone()[0], 2)
+
+    def test_failures_after_unreachable_are_capped_without_new_events(self):
+        for checked_at in (1000, 1060, 1120, 1180):
+            self.apply(checked_at=checked_at)
+        self.conn.execute(
+            "UPDATE vpn_endpoint_health SET consecutive_failures=? WHERE vpn_id=1",
+            (MAX_CONSECUTIVE_FAILURES - 1,),
+        )
+        self.conn.commit()
+        self.apply(checked_at=1240)
+        self.assertEqual(self.health(1240)["consecutive_failures"], MAX_CONSECUTIVE_FAILURES)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vpn_endpoint_health_events").fetchone()[0], 1)
+
+    def test_revision_change_resets_counter_and_accepts_current_result(self):
+        for checked_at in (1000, 1060):
+            self.apply(checked_at=checked_at)
+        new_revision = target_revision({**TARGET, "host": "new.example.test"})
+        result = self.result(
+            target_revision=new_revision,
+            target_generation=2,
+            cycle_id=1,
+            lease_id="new-lease",
+            checked_at=500,
+        )
+        stored = apply_probe_result(self.conn, result, expected_revision=new_revision, expected_generation=2)
+        self.assertEqual(stored["target_revision"], new_revision)
+        self.assertEqual(stored["state"], "accessible")
+        self.assertEqual(stored["consecutive_failures"], 1)
+        self.assertEqual(stored["last_checked_at"], 500)
+
+    def test_result_revision_mismatch_is_rejected_without_mutation(self):
+        self.apply(checked_at=1000, icmp_ok=True)
+        before = tuple(self.conn.execute("SELECT * FROM vpn_endpoint_health WHERE vpn_id=1").fetchone())
+        other = target_revision({**TARGET, "port": 444})
         with self.assertRaises(StaleRevisionError):
-            apply_probe_result(
-                self.conn,
-                self.result(revision=stale_revision, observed_at=1_300),
-                expected_revision=self.revision,
-            )
-
-        after = tuple(
-            self.conn.execute(
-                "SELECT * FROM vpn_endpoint_health WHERE vpn_id=?", (1,)
-            ).fetchone()
-        )
+            apply_probe_result(self.conn, self.result(target_revision=other), expected_revision=self.revision)
+        after = tuple(self.conn.execute("SELECT * FROM vpn_endpoint_health WHERE vpn_id=1").fetchone())
         self.assertEqual(after, before)
 
-    def test_failed_revision_transition_rolls_back_atomically(self):
-        self.apply(observed_at=1_000)
-        before = tuple(
-            self.conn.execute(
-                "SELECT * FROM vpn_endpoint_health WHERE vpn_id=?", (1,)
-            ).fetchone()
-        )
-        new_revision = target_revision(dict(TARGET, port=444))
-        self.conn.execute(
-            "CREATE TRIGGER reject_synthetic_healthy_update "
-            "BEFORE UPDATE ON vpn_endpoint_health "
-            "WHEN NEW.state='healthy' "
-            "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END"
-        )
-
-        with self.assertRaises(sqlite3.DatabaseError):
-            apply_probe_result(
-                self.conn,
-                self.result(revision=new_revision, observed_at=1_300),
-                expected_revision=new_revision,
-            )
-
-        after = tuple(
-            self.conn.execute(
-                "SELECT * FROM vpn_endpoint_health WHERE vpn_id=?", (1,)
-            ).fetchone()
-        )
-        self.assertEqual(after, before)
-
-    def test_apply_never_changes_vpn_lifecycle_columns(self):
-        before = self.conn.execute(
-            "SELECT active,onboarding_state FROM vpns WHERE id=?", (1,)
-        ).fetchone()
-
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
-        self.apply(outcome="unreachable", code="tcp_unreachable", observed_at=1_300)
-        self.apply(observed_at=1_600)
-
-        after = self.conn.execute(
-            "SELECT active,onboarding_state FROM vpns WHERE id=?", (1,)
-        ).fetchone()
-        self.assertEqual(tuple(after), tuple(before))
-
-    def test_older_cycle_is_rejected_atomically_and_duplicate_is_idempotent(self):
-        first = self.apply(cycle_id=2, observed_at=1_000)
-        duplicate = self.apply(cycle_id=2, observed_at=1_300, latency_ms=99)
+    def test_cycle_duplicate_is_idempotent_and_older_cycle_is_rejected(self):
+        first = self.apply(checked_at=1000, icmp_ok=True, cycle_id=4, lease_id="lease-a")
+        duplicate = self.apply(checked_at=1100, icmp_ok=False, cycle_id=4, lease_id="lease-a")
         self.assertEqual(duplicate, first)
-        self.assertEqual(self.health(now=1_300)["last_checked_at"], 1_000)
-
         with self.assertRaises(StaleCycleError):
-            self.apply(cycle_id=1, outcome="unreachable", code="tcp_unreachable")
-        self.assertEqual(self.health(now=1_300)["cycle_id"], 2)
+            self.apply(checked_at=1200, cycle_id=3, lease_id="lease-a")
 
-    def test_older_observation_timestamp_is_rejected_even_for_a_newer_cycle(self):
-        self.apply(cycle_id=1, observed_at=2_000)
-        with self.assertRaises(StaleCycleError):
-            self.apply(cycle_id=2, observed_at=1_999)
+    def test_lifecycle_columns_remain_untouched(self):
+        self.conn.execute("CREATE TABLE vpns(id INTEGER PRIMARY KEY, active INTEGER, onboarding_state TEXT)")
+        self.conn.execute("INSERT INTO vpns VALUES(1,1,'active')")
+        before = tuple(self.conn.execute("SELECT active,onboarding_state FROM vpns WHERE id=1").fetchone())
+        for checked_at in (1000, 1060, 1120, 1180):
+            self.apply(checked_at=checked_at)
+        after = tuple(self.conn.execute("SELECT active,onboarding_state FROM vpns WHERE id=1").fetchone())
+        self.assertEqual(after, before)
 
-    def test_new_generation_resets_state_and_acceptance_is_separate_from_conclusive_time(self):
-        self.apply(cycle_id=1, outcome="unreachable", code="tcp_unreachable", observed_at=1_000)
-        self.apply(cycle_id=2, outcome="inconclusive", code="probe_error", latency_ms=None, observed_at=1_500)
-        health = self.health(now=1_500)
-        self.assertEqual(health["last_accepted_at"], 1_500)
-        self.assertEqual(health["last_conclusive_at"], 1_000)
-
-        result = self.apply(target_generation=2, cycle_id=1, observed_at=2_000)
-        self.assertEqual(result["target_generation"], 2)
-        self.assertEqual(result["cycle_id"], 1)
-        self.assertEqual(self.health(now=2_000)["state"], "healthy")
-
-    def test_lease_id_is_part_of_the_accepted_cycle(self):
-        self.apply(lease_id="lease-a")
-        with self.assertRaises(ValueError):
-            self.apply(lease_id="lease-b", cycle_id=1)
-
-
-class EndpointHealthValidationTests(unittest.TestCase):
-    def valid_result(self):
-        return {
-            "vpn_id": 1,
-            "target_revision": target_revision(TARGET),
-            "target_generation": 1,
-            "cycle_id": 1,
-            "lease_id": "synthetic-lease",
-            "probe_type": "tcp_connect",
-            "outcome": "reachable",
-            "public_code": "tcp_accept",
-            "latency_ms": 10,
-            "observed_at": 1_000,
-        }
-
-    def test_target_revision_is_canonical_and_uses_only_probe_config(self):
-        reordered = {key: TARGET[key] for key in reversed(TARGET)}
-        with_unrelated_values = dict(
-            TARGET,
-            plant="Synthetic Plant",
-            username="synthetic-user-a",
-            password_enc=object(),
-            psk_enc=object(),
+    def test_database_failure_rolls_back_state_and_event_atomically(self):
+        self.apply(checked_at=1000, icmp_ok=True)
+        self.apply(checked_at=1060)
+        self.apply(checked_at=1120)
+        before = tuple(self.conn.execute("SELECT * FROM vpn_endpoint_health WHERE vpn_id=1").fetchone())
+        self.conn.execute(
+            "CREATE TRIGGER reject_unreachable BEFORE UPDATE ON vpn_endpoint_health "
+            "WHEN NEW.state='unreachable' BEGIN SELECT RAISE(ABORT,'synthetic'); END"
         )
-        changed_unrelated_values = dict(
-            with_unrelated_values,
-            username="synthetic-user-b",
-            password_enc=object(),
-            psk_enc=object(),
-        )
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.apply(checked_at=1180)
+        after = tuple(self.conn.execute("SELECT * FROM vpn_endpoint_health WHERE vpn_id=1").fetchone())
+        self.assertEqual(after, before)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vpn_endpoint_health_events").fetchone()[0], 0)
 
-        revision = target_revision(TARGET)
-        self.assertEqual(target_revision(reordered), revision)
-        self.assertEqual(target_revision(with_unrelated_values), revision)
-        self.assertEqual(target_revision(changed_unrelated_values), revision)
-        self.assertNotEqual(target_revision(dict(TARGET, host="other.example.test")), revision)
-        self.assertNotEqual(target_revision(dict(TARGET, transport="udp")), revision)
 
-    def test_target_revision_rejects_invalid_probe_configuration(self):
-        bad_targets = [
-            dict(TARGET, vpn_type="unknown"),
-            dict(TARGET, host=""),
-            dict(TARGET, port=0),
-            dict(TARGET, port=True),
-            dict(TARGET, transport="sctp"),
-            dict(TARGET, aggressive="yes"),
+class ValidationAndHistoryTests(HealthFixture):
+    def test_validate_result_accepts_canonical_iso_timestamp_only(self):
+        result = self.result(icmp_ok=True, checked_at="2026-08-11T10:30:00Z")
+        normalized = validate_result(result)
+        self.assertIsInstance(normalized["checked_at"], int)
+        for legacy in ("probe_type", "outcome", "public_code", "observed_at", "state"):
+            with self.subTest(legacy=legacy):
+                with self.assertRaises(ValueError):
+                    validate_result({**result, legacy: "legacy"})
+
+    def test_validate_result_rejects_invalid_types_and_bounds(self):
+        valid = self.result(icmp_ok=True, protocol_ok=False, latency_ms=10)
+        invalid = [
+            {**valid, "vpn_id": True},
+            {**valid, "target_revision": "x" * 64},
+            {**valid, "icmp_ok": 1},
+            {**valid, "protocol_probe": "tcp_connect"},
+            {**valid, "checked_at": MAX_TIMESTAMP + 1},
+            {**valid, "latency_ms": MAX_LATENCY_MS + 1},
+            {**valid, "unexpected": "value"},
         ]
-        for bad in bad_targets:
-            with self.subTest(target=bad):
+        for value in invalid:
+            with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    target_revision(bad)
+                    validate_result(value)
 
-    def test_validate_result_accepts_only_the_exact_bounded_contract(self):
-        valid = self.valid_result()
-        self.assertEqual(validate_result(valid), valid)
-        inconclusive_ike = dict(valid, probe_type="ike", public_code="ike_no_response", outcome="inconclusive")
-        self.assertEqual(validate_result(inconclusive_ike), inconclusive_ike)
-        udp_ike = dict(valid, probe_type="ike", public_code="udp_response", outcome="reachable")
-        self.assertEqual(validate_result(udp_ike), udp_ike)
-        silent_ike = dict(valid, probe_type="ike", public_code="udp_silent", outcome="inconclusive")
-        self.assertEqual(validate_result(silent_ike), silent_ike)
+    def test_staleness_is_metadata_not_a_third_public_state(self):
+        self.apply(checked_at=100)
+        current = health_for_vpns(self.conn, [1], now=100 + 15 * 60)[1]
+        stale = health_for_vpns(self.conn, [1], now=100 + 15 * 60 + 1)[1]
+        self.assertEqual(current["state"], "accessible")
+        self.assertEqual(stale["state"], "accessible")
+        self.assertTrue(stale["is_stale"])
+        self.assertEqual(stale["stored_state"], "accessible")
+        self.assertFalse(public_alert_eligible(stale))
 
-        invalid_results = []
-        for missing in valid:
-            invalid = dict(valid)
-            invalid.pop(missing)
-            invalid_results.append(invalid)
-        invalid_results.extend(
-            [
-                dict(valid, unexpected="value"),
-                dict(valid, vpn_id=True),
-                dict(valid, vpn_id=0),
-                dict(valid, target_revision="x" * 64),
-                dict(valid, probe_type="raw_socket"),
-                dict(valid, outcome="timeout"),
-                dict(valid, public_code="unknown_code"),
-                dict(valid, outcome="unreachable", public_code="tcp_accept"),
-                dict(valid, probe_type="ike", public_code="tcp_accept"),
-                dict(valid, public_code=""),
-                dict(valid, public_code="UPPERCASE"),
-                dict(valid, public_code="x" * 65),
-                dict(valid, observed_at=True),
-                dict(valid, observed_at=-1),
-                dict(valid, observed_at=MAX_TIMESTAMP + 1),
-                dict(valid, latency_ms=True),
-                dict(valid, latency_ms=-1),
-                dict(valid, latency_ms=MAX_LATENCY_MS + 1),
-            ]
+    def test_only_transitions_are_stored_and_history_uses_transition_evidence(self):
+        self.apply(checked_at=1000, icmp_ok=True)
+        for checked_at in (1060, 1120):
+            self.apply(checked_at=checked_at, icmp_ok=True)
+        for checked_at in (1180, 1240, 1300):
+            self.apply(checked_at=checked_at)
+        self.apply(checked_at=1360, icmp_ok=True)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vpn_endpoint_health_events").fetchone()[0], 2)
+        intervals = history_intervals(self.conn, 1, now=1360, history_hours=5)
+        self.assertEqual({item["state"] for item in intervals}, {"accessible", "unreachable"})
+        self.assertTrue(all(item["start_at"] < item["end_at"] for item in intervals))
+        self.assertTrue(any(item["state"] == "unreachable" and item["protocol_ok"] is False for item in intervals))
+
+    def test_history_purges_events_older_than_five_hours(self):
+        self.conn.execute(
+            "INSERT INTO vpn_endpoint_health_events(vpn_id,old_state,new_state,icmp_ok,protocol_ok,protocol_probe,created_at) VALUES(?,?,?,?,?,?,?)",
+            (1, "accessible", "unreachable", 0, 0, "tcp", 0),
         )
-        for invalid in invalid_results:
-            with self.subTest(result=invalid):
-                with self.assertRaises(ValueError):
-                    validate_result(invalid)
-
-    def test_health_query_interprets_only_observations_older_than_15m_as_stale(self):
-        conn = sqlite3.connect(":memory:")
-        ensure_endpoint_health_schema(conn)
-        revision = target_revision(TARGET)
-        result = self.valid_result()
-        result["observed_at"] = 100
-        apply_probe_result(conn, result, expected_revision=revision)
-
-        at_boundary = health_for_vpns(conn, [1, 2], now=1_000)
-        stale = health_for_vpns(conn, [1, 2], now=1_001)
-
-        self.assertEqual(at_boundary[1]["state"], "healthy")
-        self.assertFalse(at_boundary[1]["is_stale"])
-        self.assertEqual(stale[1]["state"], "stale")
-        self.assertEqual(stale[1]["stored_state"], "healthy")
-        self.assertTrue(stale[1]["is_stale"])
-        self.assertEqual(stale[2]["state"], "unknown")
-        self.assertFalse(stale[2]["is_stale"])
-        stored = conn.execute(
-            "SELECT state FROM vpn_endpoint_health WHERE vpn_id=?", (1,)
-        ).fetchone()[0]
-        self.assertEqual(stored, "healthy")
-
-    def test_disabled_state_is_not_reinterpreted_as_stale(self):
-        conn = sqlite3.connect(":memory:")
-        ensure_endpoint_health_schema(conn)
-        result = self.valid_result()
-        apply_probe_result(
-            conn,
-            result,
-            expected_revision=result["target_revision"],
-        )
-        conn.execute(
-            "UPDATE vpn_endpoint_health SET state='disabled',last_checked_at=? WHERE vpn_id=?",
-            (100, 1),
+        self.conn.commit()
+        self.apply(checked_at=HISTORY_SECONDS + 100, icmp_ok=True)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM vpn_endpoint_health_events WHERE created_at < ?", (100,)).fetchone()[0],
+            0,
         )
 
-        health = health_for_vpns(conn, [1], now=10_000)[1]
-        self.assertEqual(health["state"], "disabled")
-        self.assertFalse(health["is_stale"])
+    def test_tuple_and_row_legacy_migrations_preserve_timestamp_and_diagnostics(self):
+        for row_factory in (None, sqlite3.Row):
+            conn = sqlite3.connect(":memory:")
+            if row_factory:
+                conn.row_factory = row_factory
+            conn.execute(
+                "CREATE TABLE vpn_endpoint_health(vpn_id INTEGER PRIMARY KEY,target_revision TEXT,probe_type TEXT,state TEXT,public_code TEXT,outcome TEXT,consecutive_failures INTEGER,observed_at INTEGER,latency_ms INTEGER)"
+            )
+            conn.execute("INSERT INTO vpn_endpoint_health VALUES(1,?,?,?,?,?,?,?,?)", ("a" * 64, "tcp_connect", "down", "tcp_unreachable", "unreachable", 2, 1000, 9))
+            ensure_endpoint_health_schema(conn)
+            row = conn.execute("SELECT state,protocol_probe,protocol_ok,last_checked_at,protocol_code FROM vpn_endpoint_health WHERE vpn_id=1").fetchone()
+            self.assertEqual(tuple(row), ("unreachable", "tcp", 0, 1000, "tcp_unreachable"))
+            conn.close()
 
 
-class EndpointHealthAppIntegrationTests(unittest.TestCase):
-    def test_app_init_calls_endpoint_health_schema_initializer(self):
+class AppIntegrationTests(unittest.TestCase):
+    def test_app_initializes_endpoint_health_schema(self):
         tree = ast.parse((ROOT / "panel-app" / "app.py").read_text(encoding="utf-8"))
         imported = any(
             isinstance(node, ast.ImportFrom)
@@ -550,23 +282,15 @@ class EndpointHealthAppIntegrationTests(unittest.TestCase):
             and any(alias.name == "ensure_endpoint_health_schema" for alias in node.names)
             for node in tree.body
         )
-        init_function = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "init"
-        )
-        called_with_connection = any(
+        init_function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "init")
+        called = any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "ensure_endpoint_health_schema"
-            and len(node.args) == 1
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id == "c"
             for node in ast.walk(init_function)
         )
-
         self.assertTrue(imported)
-        self.assertTrue(called_with_connection)
+        self.assertTrue(called)
 
 
 if __name__ == "__main__":

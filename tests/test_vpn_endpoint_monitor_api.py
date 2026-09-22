@@ -122,6 +122,14 @@ class EndpointMonitorApiTests(unittest.TestCase):
     def auth_headers(self, token=None):
         return {"Authorization": "Bearer " + (self.token if token is None else token)}
 
+    def setUp(self):
+        with self.mod.app.app_context():
+            conn = self.mod.db()
+            conn.execute("DELETE FROM vpn_endpoint_health_events")
+            conn.execute("DELETE FROM vpn_endpoint_health")
+            conn.execute("DELETE FROM vpn_endpoint_monitor_leases")
+            conn.commit()
+
     def target_payload(self):
         response = self.client.get(
             "/internal/vpn-endpoint-monitor/targets", headers=self.auth_headers()
@@ -236,11 +244,13 @@ class EndpointMonitorApiTests(unittest.TestCase):
             "target_generation": target["target_generation"],
             "cycle_id": target["cycle_id"],
             "lease_id": target["lease_id"],
-            "probe_type": "ike",
-            "outcome": "reachable",
-            "public_code": "ike_response",
+            "icmp_ok": False,
+            "protocol_ok": True,
+            "protocol_probe": "ike",
+            "protocol_code": "ike_response",
+            "icmp_code": "icmp_timeout",
             "latency_ms": 42,
-            "observed_at": 1_700_000_000,
+            "checked_at": 1_700_000_000,
         }
         response = self.client.post(
             "/internal/vpn-endpoint-monitor/results",
@@ -254,9 +264,9 @@ class EndpointMonitorApiTests(unittest.TestCase):
                 "SELECT state,consecutive_failures FROM vpn_endpoint_health WHERE vpn_id=?",
                 (self.ipsec_id,),
             ).fetchone()
-            self.assertEqual(tuple(row), ("healthy", 0))
+            self.assertEqual(tuple(row), ("accessible", 0))
 
-        stale = dict(result, target_revision="0" * 64, public_code="ike_unreachable", outcome="unreachable")
+        stale = dict(result, target_revision="0" * 64, icmp_ok=False, protocol_ok=False, protocol_code="ike_unreachable")
         response = self.client.post(
             "/internal/vpn-endpoint-monitor/results",
             json={"results": [stale]},
@@ -268,7 +278,7 @@ class EndpointMonitorApiTests(unittest.TestCase):
                 "SELECT state,consecutive_failures FROM vpn_endpoint_health WHERE vpn_id=?",
                 (self.ipsec_id,),
             ).fetchone()
-            self.assertEqual(tuple(row), ("healthy", 0))
+            self.assertEqual(tuple(row), ("accessible", 0))
 
     def test_invalid_batch_duplicate_and_unknown_ids_are_rejected_without_mutation(self):
         payload = self.target_payload()["targets"]
@@ -279,11 +289,13 @@ class EndpointMonitorApiTests(unittest.TestCase):
             "target_generation": target["target_generation"],
             "cycle_id": target["cycle_id"],
             "lease_id": target["lease_id"],
-            "probe_type": "tcp_connect" if target["transport"] == "tcp" else "ike",
-            "outcome": "reachable",
-            "public_code": "tcp_accept" if target["transport"] == "tcp" else "ike_response",
+            "icmp_ok": True,
+            "protocol_ok": False,
+            "protocol_probe": "tcp" if target["transport"] == "tcp" else "ike",
+            "icmp_code": "icmp_reply",
+            "protocol_code": "tcp_unreachable" if target["transport"] == "tcp" else "ike_no_response",
             "latency_ms": 1,
-            "observed_at": 1_700_000_001,
+            "checked_at": 1_700_000_001,
         }
         duplicate = self.client.post(
             "/internal/vpn-endpoint-monitor/results",
@@ -297,6 +309,42 @@ class EndpointMonitorApiTests(unittest.TestCase):
             headers=self.auth_headers(),
         )
         self.assertEqual(unknown.status_code, 409)
+
+    def test_minimal_result_contract_is_enriched_from_current_monitor_lease(self):
+        target = next(item for item in self.target_payload()["targets"] if item["vpn_id"] == self.ipsec_id)
+        result = {
+            "vpn_id": target["vpn_id"],
+            "target_revision": target["target_revision"],
+            "icmp_ok": True,
+            "protocol_ok": False,
+            "protocol_probe": "ike",
+            "checked_at": 1_700_000_100,
+        }
+        response = self.client.post(
+            "/internal/vpn-endpoint-monitor/results",
+            json={"results": [result]},
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"accepted": 1, "ok": True, "rejected": 0})
+
+    def test_partial_lease_metadata_is_rejected(self):
+        target = next(item for item in self.target_payload()["targets"] if item["vpn_id"] == self.ipsec_id)
+        result = {
+            "vpn_id": target["vpn_id"],
+            "target_revision": target["target_revision"],
+            "target_generation": target["target_generation"],
+            "icmp_ok": True,
+            "protocol_ok": False,
+            "protocol_probe": "ike",
+            "checked_at": 1_700_000_101,
+        }
+        response = self.client.post(
+            "/internal/vpn-endpoint-monitor/results",
+            json={"results": [result]},
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(response.status_code, 400)
 
 
 if __name__ == "__main__":

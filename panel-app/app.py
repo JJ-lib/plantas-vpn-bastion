@@ -8,13 +8,13 @@ from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messa
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
-from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, history_intervals, configure_sqlite_connection, StaleRevisionError, StaleCycleError, target_revision, validate_result
+from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, history_intervals, configure_sqlite_connection, public_alert_eligible, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
 from plant_paths import plant_artifact_dir
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
 DB=os.environ.get('PANEL_DB',os.path.join(DATA_DIR,'panel.db')); BASE=os.environ.get('PROJECT_DIR','/opt/bastion-vpn')
-PUBLIC_ORIGIN=os.environ.get('BASTION_PUBLIC_ORIGIN','').strip().rstrip('/')
+PUBLIC_ORIGIN=os.environ.get('BASTION_PUBLIC_ORIGIN','http://127.0.0.1').strip().rstrip('/')
 LOOPBACK_PUBLIC_HOSTS={'127.0.0.1','localhost','::1'}
 def configured_public_origin(require_https=False):
     raw=PUBLIC_ORIGIN
@@ -410,10 +410,13 @@ def admin(f):
         return f(*a,**kw)
     return w
 
+ENDPOINT_PUBLIC_ALERTS_ENV='VPN_ENDPOINT_PUBLIC_ALERTS_ENABLED'
 ENDPOINT_MONITOR_COLLECTION_ENV='VPN_ENDPOINT_MONITOR_COLLECTION_ENABLED'
 ENDPOINT_ADMIN_DIAGNOSTICS_ENV='VPN_ENDPOINT_ADMIN_DIAGNOSTICS_ENABLED'
 def _feature_enabled(name):
     return os.environ.get(name,'false').strip().lower() in {'1','true','yes','on'}
+def endpoint_public_alerts_enabled():
+    return _feature_enabled(ENDPOINT_PUBLIC_ALERTS_ENV)
 def endpoint_monitor_collection_enabled():
     return _feature_enabled(ENDPOINT_MONITOR_COLLECTION_ENV)
 def endpoint_admin_diagnostics_enabled():
@@ -425,6 +428,19 @@ ENDPOINT_CODE_LABELS={'not_checked':'Sin datos','icmp_reply':'ICMP: OK','icmp_ti
 def endpoint_health_map(vpns):
     ids=[int(v['id']) for v in vpns if v is not None]
     return health_for_vpns(db(),ids) if ids else {}
+
+def endpoint_card_alert(health,online,admin_view=False):
+    if not health:
+        return ''
+    if online:
+        if not endpoint_admin_diagnostics_enabled():
+            return ''
+        if admin_view and health.get('state')=='unreachable':
+            return "<div class='endpoint-probe-note' role='status'>La sonda pública no responde, pero el túnel está activo.</div>"
+        return ''
+    if not endpoint_public_alerts_enabled() or not public_alert_eligible(health):
+        return ''
+    return "<div class='endpoint-alert' role='status' aria-live='polite'><strong>Servidor VPN inaccesible</strong><span>ICMP y la sonda del protocolo han fallado durante tres ciclos consecutivos.</span></div>"
 
 def _endpoint_time(value):
     if value is None:
@@ -722,7 +738,9 @@ def idx():
             try:online=vpn_runtime(vpn)[0]
             except Exception:online=False
         status='online' if online else 'offline';web=sum(1 for e in items if e['kind']=='WEB');rdp=sum(1 for e in items if e['kind']=='RDP');vnc=sum(1 for e in items if e['kind']=='VNC');href='/plant/'+quote(plant,safe='');equipment_copy='equipo disponible' if len(items)==1 else 'equipos disponibles'
-        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div><div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
+        health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None
+        alert=endpoint_card_alert(health,online,admin_view=me()['role']=='admin')
+        b+=(f"<a class='card plant-card' href='{href}'><div><div class='plant-card-head'><h2>{html.escape(plant)}</h2><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span></div>{alert}<div class='plant-count'>{len(items)}</div><p class='plant-meta'>{equipment_copy}</p></div><div class='plant-footer'><span class='muted'>WEB {web} · RDP {rdp} · VNC {vnc}</span><span class='arrow'>→</span></div></a>")
     return page('Panel de accesos',b+'</div>')
 @app.route('/plant/<path:plant>')
 @need
@@ -733,9 +751,9 @@ def plant_access(plant):
     if vpn:
         try:online=vpn_runtime(vpn)[0]
         except Exception:online=False
-    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
+    status='online' if online else 'offline';equipment_label='equipo' if len(items)==1 else 'equipos';health=endpoint_health_map([vpn])[int(vpn['id'])] if vpn else None;back="<div class='breadcrumb-row'><a class='btn outline back-button' href='/' aria-label='Volver al panel'>← Atrás</a><div class='breadcrumb'><a href='/'>Panel de accesos</a><span>›</span><span class='breadcrumb-current'>"+html.escape(canonical)+"</span></div></div>"
     plant_url=quote(canonical,safe='');head_action=(f"<div class='vpn-restart-control'><button class='vpn-restart-button' type='button' data-restart-url='/plant/{plant_url}/vpn/restart' data-restart-csrf='{h(csrf_token())}' onclick='restartPlantVpn(this)'><span>Reiniciar VPN</span></button><span class='vpn-restart-feedback' id='vpn-restart-feedback' role='status' aria-live='polite'></span></div>" if vpn else '')
-    b=(back+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
+    b=(back+endpoint_card_alert(health,online,admin_view=me()['role']=='admin')+f"<div class='summary-row'><span class='status' data-vpn-status='{status}'><span class='status-dot'></span>VPN {status}</span><span class='badge'>{len(items)} {equipment_label}</span></div>"+equipment_tag_filter_controls()+"<div class='card table-card'><div class='table-scroll'><table id='equipment-table'><thead><tr>"+"<th><button class='sort-button' data-sort-key='name' onclick='sortEquipmentTable(this)'>Nombre</button></th><th><button class='sort-button' data-sort-key='kind' onclick='sortEquipmentTable(this)'>Tipo</button></th><th><button class='sort-button' data-sort-key='tags' onclick='sortEquipmentTable(this)'>Tags</button></th><th><button class='sort-button' data-sort-key='ip' onclick='sortEquipmentTable(this)'>IP real</button></th><th><button class='sort-button' data-sort-key='port' onclick='sortEquipmentTable(this)'>Puerto</button></th><th class='desktop-only'><button class='sort-button' data-sort-key='description' onclick='sortEquipmentTable(this)'>Descripción</button></th><th>Acceso</th></tr></thead><tbody>")
     for e in items:
         name=html.escape(e['name']);kind=html.escape(e['kind']);ip=html.escape(e['real_ip']);port=html.escape(str(e['real_port']));desc=html.escape(e['description'] or '—')
         tags=equipment_tag_names(db(),e['id']);tag_sort='|'.join(tag.casefold() for tag in tags);tag_filter=','.join(tag.casefold() for tag in tags);tag_badges=equipment_tag_badges(tags)
@@ -1439,6 +1457,7 @@ networks:
 """
     with open(plant_artifact_dir(BASE,sl)/'compose.yml','w') as fh: fh.write(compose)
 def plant_uses_bridge_tls(sl):
+    if not has_app_context(): return False
     row=db().execute("SELECT 1 FROM vpns v JOIN equipment e ON e.plant=v.plant WHERE v.slug=? AND e.active=1 AND e.kind='WEB' AND (e.web_mode='bridge_tls' OR e.web_effective_mode='bridge_tls') LIMIT 1",(sl,)).fetchone()
     if not row: return False
     cert=os.path.join(BASE,"configs","bridge.pem")
@@ -1995,8 +2014,7 @@ def equipment_values(f, old=None):
             origin=configured_public_origin(require_https=True)
             pub_url=f'https://{origin.netloc}:{proxy_port}{suffix}'
         else:
-            origin=configured_public_origin()
-            pub_url=f'{origin.geturl().rstrip("/")}:{proxy_port}{suffix}'
+            pub_url=f'{PUBLIC_ORIGIN}:{proxy_port}{suffix}'
     if web_mode=='bridge_tls':
         parsed=urlsplit(pub_url)
         if parsed.scheme.lower()!='https' or not parsed.netloc: raise ValueError('El bridge TLS requiere una URL pública HTTPS')

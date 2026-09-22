@@ -1446,7 +1446,7 @@ def load_monitor_token(path: str | os.PathLike[str]) -> str:
             metadata = os.fstat(fd)
             mode = stat.S_IMODE(metadata.st_mode)
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-                    or metadata.st_gid != os.getgid() or mode & 0o377):
+                    or metadata.st_gid != os.getgid() or mode & 0o177):
                 raise ValueError("monitor token permissions are invalid")
             raw = os.read(fd, MAX_MONITOR_TOKEN_LENGTH + 2)
         finally:
