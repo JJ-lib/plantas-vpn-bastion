@@ -78,11 +78,28 @@ class OnboardingFormTests(unittest.TestCase):
   with mock.patch.object(panel,'apply_vpn',return_value=(True,'','')):self.assertEqual(self.client.get(f'/admin/vpns/{i}/generate').status_code,405)
   with mock.patch.object(panel,'apply_vpn') as apply:r=self.client.post(f'/admin/vpns/{i}/generate',data={'_csrf':self.csrf()})
   self.assertEqual(r.status_code,410);apply.assert_not_called()
- def test_active_edit_is_rejected_without_db_or_runtime_mutation(self):
-  with sqlite3.connect(os.environ['PANEL_DB']) as c:i=c.execute('select id from vpns where active=1 order by id limit 1').fetchone()[0];before=c.execute('select * from vpns where id=?',(i,)).fetchone()
-  with mock.patch.object(panel,'apply_vpn') as apply:r=self.client.post(f'/admin/vpns/{i}/edit',data={'_csrf':self.csrf()})
-  self.assertEqual(r.status_code,409);apply.assert_not_called()
-  with sqlite3.connect(os.environ['PANEL_DB']) as c:self.assertEqual(c.execute('select * from vpns where id=?',(i,)).fetchone(),before)
+ def test_active_edit_uses_controlled_apply_and_keeps_plain_password_out_of_payload(self):
+  with sqlite3.connect(os.environ['PANEL_DB']) as c:i=c.execute('select id from vpns where active=1 order by id limit 1').fetchone()[0]
+  result=mock.Mock(state='confirmed',message='ok',revision=5)
+  data={'_csrf':self.csrf(),'vpn_type':'ssl','plant':'Synthetic Form Site','slug':'form-base','host':'vpn.example.test','port':'443','username':'synthetic-user','password':'new-password','accept_gateway_certificate':'1'}
+  with mock.patch.object(panel,'_apply_active_vpn_edit',return_value=result) as apply:
+   response=self.client.post(f'/admin/vpns/{i}/edit',data=data)
+  self.assertEqual(response.status_code,302);apply.assert_called_once()
+  submitted=apply.call_args.args[1]
+  self.assertNotIn('password',submitted);self.assertNotIn('new-password',repr(submitted))
+ def test_active_edit_host_bindings_use_compose_exposed_ports(self):
+  with panel.app.app_context():
+   with mock.patch.object(panel,'render_haproxy_for_plant',return_value=('synthetic cfg',[8113,8112,8113])) as render:
+    self.assertEqual(panel._active_edit_expected_ports('Synthetic Form Site'),[8112,8113])
+   render.assert_called_once_with('Synthetic Form Site')
+ def test_active_edit_rejects_stale_revision_before_persisting(self):
+  with panel.app.app_context():
+   with sqlite3.connect(os.environ['PANEL_DB']) as c:
+    i=c.execute("select id from vpns where slug='form-base'").fetchone()[0];c.execute('update vpns set onboarding_revision=3 where id=?',(i,));c.commit()
+   conn=panel.db();row=conn.execute('select * from vpns where id=?',(i,)).fetchone();candidate=dict(row);candidate['onboarding_revision']=4;candidate['_active_edit_base_revision']=2
+   with mock.patch.object(panel,'save_vpn') as save:
+    with self.assertRaises(panel.ActiveEditError) as raised:panel._active_edit_persist_candidate(conn,candidate)
+   self.assertEqual(raised.exception.code,'stale_revision');save.assert_not_called()
  def test_invalid_draft_edit_does_not_destroy_artifacts_first(self):
   with sqlite3.connect(os.environ['PANEL_DB']) as c:i=c.execute('select id from vpns order by id limit 1').fetchone()[0];c.execute("update vpns set active=0,onboarding_state='draft' where id=?",(i,));c.commit()
   with mock.patch.object(panel,'prepare_draft_edit') as prep:r=self.client.post(f'/admin/vpns/{i}/edit',data={'_csrf':self.csrf()})

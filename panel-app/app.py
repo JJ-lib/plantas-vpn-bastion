@@ -1,19 +1,23 @@
 import threading
 import fcntl,functools
 
-import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json, hmac, stat
+import os, sqlite3, secrets, functools, subprocess, re, time, html, shutil, csv, io, ipaddress, unicodedata, json, hmac, stat, tempfile
 from urllib.parse import quote, urlsplit
+from pathlib import Path
 from datetime import datetime
 from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messages,Response,has_request_context,has_app_context,jsonify
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
+from vpn_active_edit import ActiveEditError,ActiveEditHooks,ensure_active_edit_schema,run_active_edit
 from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, history_intervals, configure_sqlite_connection, public_alert_eligible, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
+from vpn_validation import run_static_validation,target_probe_spec
 from plant_paths import plant_artifact_dir
 DATA_DIR=os.environ.get('PANEL_DATA_DIR','/data'); os.makedirs(DATA_DIR,exist_ok=True)
 DB=os.environ.get('PANEL_DB',os.path.join(DATA_DIR,'panel.db')); BASE=os.environ.get('PROJECT_DIR','/opt/bastion-vpn')
+_active_edit_generation_lock=threading.Lock()
 PUBLIC_ORIGIN=os.environ.get('BASTION_PUBLIC_ORIGIN','http://127.0.0.1').strip().rstrip('/')
 LOOPBACK_PUBLIC_HOSTS={'127.0.0.1','localhost','::1'}
 def configured_public_origin(require_https=False):
@@ -359,6 +363,7 @@ def init():
     migrate_vpn_access_columns(c)
     ensure_openvpn_import_staging(c)
     ensure_onboarding_schema(c)
+    ensure_active_edit_schema(c)
     ensure_endpoint_health_schema(c)
     ensure_monitor_lease_schema(c)
     c.execute("UPDATE vpns SET ipsec_engine='libreswan' WHERE ipsec_engine IS NULL OR trim(ipsec_engine)=''")
@@ -1277,6 +1282,219 @@ def reset_inactive_vpn_draft(v):
         if os.path.isdir(path):shutil.rmtree(path)
     db().execute("UPDATE vpns SET active=0,onboarding_state='draft',validation_stage='local',validation_code='pending',validation_detail='Pendiente de validación local.',next_retry_at=NULL,retry_count=0 WHERE id=?",(v['id'],));db().commit()
 
+def _active_edit_runner(argv,timeout=30):
+    result=subprocess.run(argv,cwd=BASE,text=True,capture_output=True,timeout=timeout)
+    return result.returncode,(result.stdout or '')+'\n'+(result.stderr or '')
+
+def _active_edit_stage_tree(source,target):
+    source=Path(source);target=Path(target)
+    if source.exists():shutil.copytree(source,target,symlinks=False)
+    else:target.mkdir(parents=True,exist_ok=True)
+
+def _active_edit_atomic_copy(source,target):
+    source=Path(source);target=Path(target);target.parent.mkdir(parents=True,exist_ok=True)
+    token=secrets.token_urlsafe(12);temp=target.parent/('.active-edit-'+token)
+    try:
+        with source.open('rb') as src, temp.open('wb') as temp_file:
+            shutil.copyfileobj(src,temp_file);temp_file.flush();os.fsync(temp_file.fileno())
+        shutil.copystat(source,temp,follow_symlinks=False);os.replace(temp,target)
+    finally:
+        if temp.exists():temp.unlink()
+
+def _active_edit_sync_tree(source,target):
+    source=Path(source);target=Path(target)
+    if not source.is_dir():raise ActiveEditError('candidate_invalid','Falta un artefacto generado de la VPN.')
+    target.mkdir(parents=True,exist_ok=True)
+    for path in source.rglob('*'):
+        if path.is_symlink():raise ActiveEditError('candidate_invalid','Los artefactos generados contienen un enlace no permitido.')
+        relative=path.relative_to(source);destination=target/relative
+        if path.is_dir():destination.mkdir(parents=True,exist_ok=True);continue
+        if not path.is_file():raise ActiveEditError('candidate_invalid','Los artefactos generados contienen un tipo no permitido.')
+        _active_edit_atomic_copy(path,destination)
+
+def _active_edit_stage_candidate(candidate,base):
+    slug=str(candidate.get('slug') or '')
+    live_config=Path(base)/'configs'/slug
+    live_artifacts=plant_artifact_dir(base,slug)
+    staging_parent=Path(base)/'.vpn-active-edit-staging';staging_parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    stage=Path(tempfile.mkdtemp(prefix='.edit-',dir=staging_parent));stage_config=stage/'configs'/slug;stage_config.parent.mkdir(parents=True,exist_ok=True)
+    stage_artifacts=stage/live_artifacts.relative_to(Path(base));stage_artifacts.parent.mkdir(parents=True,exist_ok=True)
+    try:
+        _active_edit_stage_tree(live_config,stage_config)
+        _active_edit_stage_tree(live_artifacts,stage_artifacts)
+        root_compose=Path(base)/'docker-compose.yml'
+        if root_compose.is_file():_active_edit_atomic_copy(root_compose,stage/'docker-compose.yml')
+        bridge=Path(base)/'configs'/'bridge.pem'
+        if bridge.is_file():_active_edit_atomic_copy(bridge,stage/'configs'/'bridge.pem')
+        global BASE
+        with _active_edit_generation_lock:
+            previous_base=BASE;BASE=str(stage)
+            try:
+                plant=str(candidate.get('plant') or '')
+                ensure_haproxy(slug,plant)
+                kind=str(candidate.get('vpn_type') or '')
+                if kind=='openvpn':gen_openvpn(candidate,slug)
+                elif kind=='pptp':gen_pptp(candidate,slug)
+                elif kind=='ssl':gen_ssl(candidate,slug)
+                elif kind=='ipsec':gen_ipsec(candidate,slug)
+                else:raise ActiveEditError('candidate_invalid','Tipo de VPN no soportado.')
+                cfg,ports=render_haproxy_for_plant(plant)
+                (stage_config/'haproxy.cfg').write_text(cfg,encoding='utf-8')
+                compose=stage_artifacts/'compose.yml'
+                if not compose.is_file():raise ActiveEditError('candidate_invalid','Falta el Compose generado de la VPN.')
+                compose_text=compose.read_text(encoding='utf-8')
+                rewrite=db().execute("SELECT * FROM equipment WHERE plant=? AND active=1 AND kind='WEB' AND web_effective_mode='rewrite_cache' ORDER BY id",(plant,)).fetchall()
+                compose_text=update_webfix_compose_text(update_compose_ports_text(compose_text,ports),slug,bool(rewrite))
+                compose.write_text(compose_text,encoding='utf-8')
+                webfix=stage_config/'webfix.conf'
+                if rewrite:webfix.write_text(render_webfix_config(slug,rewrite),encoding='utf-8')
+                elif webfix.exists():webfix.unlink()
+            finally:BASE=previous_base
+        return {'root':stage,'config':stage_config,'artifacts':stage_artifacts,'slug':slug}
+    except Exception:
+        shutil.rmtree(stage,ignore_errors=True)
+        raise
+
+def _active_edit_validate_candidate(candidate,artifact):
+    result=run_static_validation(candidate,artifact['root'],_active_edit_runner)
+    if getattr(result,'code','')!='local_validated':
+        raise ActiveEditError('candidate_invalid','La configuración candidata no supera el preflight estático.')
+
+def _active_edit_cleanup_candidate(artifact):
+    if artifact and artifact.get('root'):shutil.rmtree(artifact['root'],ignore_errors=True)
+
+def _active_edit_container_baseline(slug):
+    rc,out=_active_edit_runner(['docker','ps','-a','--format','{{.Names}}'],timeout=30)
+    if rc!=0:raise ActiveEditError('isolation_failed','No se pudo obtener la línea base de contenedores.')
+    excluded={'vpn-'+slug,'webfix-'+slug};baseline={}
+    for name in sorted(x.strip() for x in out.splitlines() if x.strip() and x.strip() not in excluded):
+        rc,info=_active_edit_runner(['docker','inspect','--format','{{.Id}}|{{.Image}}|{{.State.Status}}|{{.RestartCount}}|{{.HostConfig.NetworkMode}}',name],timeout=20)
+        if rc!=0:raise ActiveEditError('isolation_failed','No se pudo inspeccionar la línea base de contenedores.')
+        baseline[name]=info.strip()
+    return baseline
+
+def _active_edit_assert_container_baseline(baseline,slug):
+    current=_active_edit_container_baseline(slug)
+    if current!=baseline:raise ActiveEditError('isolation_failed','Se detectó un cambio fuera de la VPN editada.')
+
+def _active_edit_expected_ports(plant):
+    try:
+        _, exposed=render_haproxy_for_plant(plant)
+    except Exception as exc:
+        raise ActiveEditError('listener_gate_failed','No se pudieron determinar los puertos publicados.') from exc
+    try:
+        return sorted({int(value) for value in exposed})
+    except (TypeError,ValueError) as exc:
+        raise ActiveEditError('listener_gate_failed','Existe un puerto publicado no válido.') from exc
+
+def _active_edit_expected_haproxy_ports(plant):
+    ports=[]
+    for row in db().execute('SELECT kind,proxy_port,public_url FROM equipment WHERE plant=? AND active=1',(plant,)).fetchall():
+        if row['kind'] not in {'WEB','RDP','VNC'}: continue
+        value=row['proxy_port'] or public_port_from_url(row['public_url'])
+        if value:
+            try:ports.append(int(value))
+            except (TypeError,ValueError) as exc:raise ActiveEditError('listener_gate_failed','Existe un listener HAProxy no válido.') from exc
+    return sorted(set(ports))
+
+def _active_edit_haproxy_bindings(slug):
+    path=Path(BASE)/'configs'/slug/'haproxy.cfg'
+    try:text=path.read_text(encoding='utf-8')
+    except (OSError,UnicodeError) as exc:raise ActiveEditError('listener_gate_failed','No se pudo leer la configuración activa de HAProxy.') from exc
+    ports=set()
+    for line in text.splitlines():
+        match=re.match(r'^\s*bind\s+(?:\[[^]]+\]|[^:\s]+):(\d+)\b',line)
+        if match:ports.add(int(match.group(1)))
+    return ports
+
+def _active_edit_port_bindings(slug):
+    rc,out=_active_edit_runner(['docker','inspect','--format','{{json .HostConfig.PortBindings}}','vpn-'+slug],timeout=20)
+    if rc!=0:raise ActiveEditError('listener_gate_failed','No se pudieron verificar los listeners de la VPN.')
+    try:data=json.loads(out.strip() or '{}') or {}
+    except json.JSONDecodeError as exc:raise ActiveEditError('listener_gate_failed','La información de listeners no es válida.') from exc
+    ports=set()
+    for values in data.values():
+        for item in values or []:
+            try:ports.add(int(item.get('HostPort')))
+            except (TypeError,ValueError):continue
+    return ports
+
+def _active_edit_service_state(name):
+    rc,out=_active_edit_runner(['docker','inspect','--format','{{.State.Running}}|{{.State.Health.Status}}','--',name],timeout=20)
+    if rc!=0:return False,''
+    running,health=(out.strip().split('|',1)+[''])[:2]
+    return running.lower()=='true',health.lower()
+
+def _active_edit_verify_runtime(candidate,baseline):
+    online,_,_=wait_vpn_runtime(candidate,timeout=int(os.environ.get('ACTIVE_EDIT_RUNTIME_TIMEOUT','24')))
+    if not online:raise ActiveEditError('runtime_failed','La VPN no alcanzó un estado saludable.')
+    slug=str(candidate['slug']);running,health=_active_edit_service_state('vpn-'+slug)
+    if not running or health in {'unhealthy','starting'}:raise ActiveEditError('runtime_failed','El contenedor VPN no está saludable.')
+    expected=_active_edit_expected_ports(str(candidate['plant']));bound=_active_edit_port_bindings(slug)
+    if not set(expected).issubset(bound):raise ActiveEditError('listener_gate_failed','No están disponibles todos los listeners publicados.')
+    expected_haproxy=_active_edit_expected_haproxy_ports(str(candidate['plant']));actual_haproxy=_active_edit_haproxy_bindings(slug)
+    if not set(expected_haproxy).issubset(actual_haproxy):raise ActiveEditError('listener_gate_failed','No están disponibles todos los listeners internos de HAProxy.')
+    rc,_=_active_edit_runner(['docker','exec','vpn-'+slug,'sh','-lc','test -s /etc/haproxy/haproxy.cfg'],timeout=15)
+    if rc!=0:raise ActiveEditError('listener_gate_failed','HAProxy no tiene una configuración activa válida.')
+    rewrite=db().execute("SELECT 1 FROM equipment WHERE plant=? AND active=1 AND kind='WEB' AND web_effective_mode='rewrite_cache' LIMIT 1",(candidate['plant'],)).fetchone()
+    if rewrite:
+        sidecar_running,sidecar_health=_active_edit_service_state('webfix-'+slug)
+        if not sidecar_running or sidecar_health in {'unhealthy','starting'}:raise ActiveEditError('listener_gate_failed','El sidecar WEB no está saludable.')
+    target_ip=str(candidate.get('validation_target_ip') or '').strip();target_port=str(candidate.get('validation_target_port') or '').strip()
+    if target_ip and target_port:
+        try:spec=target_probe_spec(slug,target_ip,target_port)
+        except ValueError as exc:raise ActiveEditError('target_gate_failed','El destino de validación no es válido.') from exc
+        rc,_=_active_edit_runner(spec,timeout=15)
+        if rc!=0:raise ActiveEditError('target_gate_failed','El destino de validación no responde por TCP.')
+    _active_edit_assert_container_baseline(baseline,slug)
+
+def _active_edit_persist_candidate(conn,candidate):
+    base_revision=int(candidate.get('_active_edit_base_revision',int(candidate.get('onboarding_revision') or 0)-1))
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        current_before=conn.execute('SELECT onboarding_revision FROM vpns WHERE id=?',(int(candidate['id']),)).fetchone()
+        if not current_before or int(current_before['onboarding_revision'] or 0)!=base_revision:
+            raise ActiveEditError('stale_revision','La VPN cambió antes de aplicar la edición.')
+        values={key:candidate.get(key,'') for key in WRITE if key in candidate}
+        save_vpn(values,int(candidate['id']),transaction_conn=conn,commit=False)
+        current=conn.execute('SELECT onboarding_revision FROM vpns WHERE id=?',(int(candidate['id']),)).fetchone()
+        expected=int(candidate.get('onboarding_revision') or 0)
+        if not current or int(current['onboarding_revision'] or 0)!=expected:raise ActiveEditError('stale_revision','La VPN cambió antes de aplicar la edición.')
+        conn.execute("""UPDATE vpns SET active=1,onboarding_state='active',validation_stage='runtime',
+            validation_code='active_edit_applying',validation_detail='Aplicación activa en curso.',
+            next_retry_at=NULL,retry_count=0 WHERE id=?""",(int(candidate['id']),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+def _active_edit_restore_database(conn,old):
+    columns={row[1] for row in conn.execute('PRAGMA table_info(vpns)').fetchall()};pairs=[(key,value) for key,value in dict(old).items() if key in columns and key!='id']
+    if not pairs:raise ActiveEditError('rollback_failed','No hay columnas para restaurar la VPN.')
+    assignments=','.join(key+'=?' for key,_ in pairs);conn.execute('UPDATE vpns SET '+assignments+' WHERE id=?',[value for _,value in pairs]+[int(old['id'])]);conn.commit()
+
+def _active_edit_finalize_candidate(conn,candidate,backup_id):
+    cursor=conn.execute("""UPDATE vpns SET active=1,onboarding_state='active',validation_stage='runtime',
+        validation_code='active_edit_confirmed',validation_detail='Edición activa confirmada tras superar todos los gates.',
+        last_checked_at=?,next_retry_at=NULL,retry_count=0 WHERE id=? AND onboarding_revision=?""",(int(time.time()),int(candidate['id']),int(candidate['onboarding_revision'])))
+    if cursor.rowcount!=1:raise ActiveEditError('stale_revision','La revisión cambió antes de confirmarse.')
+    conn.commit()
+
+def _apply_active_vpn_edit(old,vals):
+    old=dict(old);candidate=dict(old);candidate.update(vals);candidate['id']=int(old['id']);candidate['slug']=str(old['slug']);candidate['plant']=old['plant'];candidate['_active_edit_base_revision']=int(old['onboarding_revision'] or 0);candidate['onboarding_revision']=candidate['_active_edit_base_revision']+1
+    baseline=_active_edit_container_baseline(candidate['slug'])
+    def apply_candidate(artifact):
+        _active_edit_sync_tree(artifact['config'],Path(BASE)/'configs'/candidate['slug'])
+        _active_edit_sync_tree(artifact['artifacts'],plant_artifact_dir(BASE,candidate['slug']))
+        publish_plant(candidate['plant'])
+    def restore_runtime(row):
+        publish_plant(row['plant'])
+        online,_,_=wait_vpn_runtime(row,timeout=int(os.environ.get('ACTIVE_EDIT_ROLLBACK_TIMEOUT','24')))
+        if not online:raise ActiveEditError('rollback_failed','La VPN anterior no recuperó un estado saludable tras el rollback.')
+        _active_edit_assert_container_baseline(baseline,row['slug'])
+    hooks=ActiveEditHooks(stage_candidate=_active_edit_stage_candidate,validate_candidate=_active_edit_validate_candidate,persist_candidate=_active_edit_persist_candidate,apply_candidate=apply_candidate,verify_candidate=lambda row,artifact:_active_edit_verify_runtime(row,baseline),restore_database=_active_edit_restore_database,restore_runtime=restore_runtime,finalize_candidate=_active_edit_finalize_candidate,cleanup_candidate=_active_edit_cleanup_candidate)
+    return run_active_edit(db(),old,candidate,BASE,hooks,seal=enc,unseal=dec)
+
 @app.route('/admin/vpns/<int:i>/edit',methods=['GET','POST'])
 @admin
 @vpn_mutation_lock
@@ -1288,7 +1506,23 @@ def vpn_edit(i):
         try:verify_onboarding_csrf(request.form)
         except ValueError as e:return page('Editar VPN '+kind.upper(),vf(v,kind,str(e))),400
         if int(v['active'] or 0):
-            return page('Editar VPN '+kind.upper(),vf(v,kind,'Las VPN activas no se editan in-place. Cree una revisión controlada para no sustituir un runtime operativo sin rollback durable.')),409
+            try:
+                if kind=='openvpn':
+                    raw=dec(v['openvpn_profile_enc']).encode()
+                    if not raw:raise ValueError('Falta el perfil OpenVPN cifrado.')
+                    vals=openvpn_values(request.form,parse_openvpn_profile(raw),raw,v)
+                else:vals=vpn_vals(request.form,v,kind)
+                if plant_key(vals.get('plant'))!=plant_key(v['plant']):raise ValueError('La planta de una VPN activa no se puede cambiar durante la edición.')
+                result=_apply_active_vpn_edit(v,vals)
+            except ActiveEditError as e:
+                return page('Editar VPN '+kind.upper(),vf(v,kind,getattr(e,'public_message',str(e)))),409
+            except (ValueError,sqlite3.IntegrityError) as e:
+                return page('Editar VPN '+kind.upper(),vf(v,kind,str(e))),400
+            if result.state=='confirmed':
+                flash('Edición aplicada y confirmada tras superar validación, salud, listeners, HAProxy y conectividad.')
+                return redirect('/admin/vpns')
+            status=500 if result.state=='rollback_failed' else 409
+            return page('Editar VPN '+kind.upper(),vf(v,kind,result.message)),status
         try:
             if kind=='openvpn':
                 raw=dec(v['openvpn_profile_enc']).encode()
