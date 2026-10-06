@@ -299,6 +299,28 @@ class ActiveVpnEditTests(unittest.TestCase):
             0,
         )
 
+    def test_failed_gate_exposes_safe_predefined_reason(self):
+        old = {"id": 1, "slug": "demo", "onboarding_revision": 4}
+        candidate = {**old, "onboarding_revision": 5}
+        hooks, _ = self.hooks(verify_error="target gate failed")
+
+        result = run_active_edit(
+            self.conn,
+            old,
+            candidate,
+            self.base,
+            hooks,
+            seal=self.seal,
+            unseal=self.unseal,
+            now=1000,
+        )
+
+        self.assertEqual(result.state, "rolled_back")
+        self.assertEqual(result.code, "target_gate_failed")
+        self.assertIn("Motivo:", result.message)
+        self.assertIn("destino TCP", result.message)
+        self.assertNotIn("target gate failed", result.message)
+
 
 if __name__ == "__main__":
     unittest.main()

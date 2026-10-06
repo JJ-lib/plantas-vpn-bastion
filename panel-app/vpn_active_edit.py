@@ -18,6 +18,26 @@ ACTIVE_EDIT_STATES = {"applying", "confirmed", "rolled_back", "rollback_failed"}
 _MAX_FILE_BYTES = 8 * 1024 * 1024
 _MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
 
+_ACTIVE_EDIT_PUBLIC_REASONS = {
+    "candidate_invalid": "La configuración candidata no supera la validación previa.",
+    "backup_failed": "No se pudo crear el backup durable.",
+    "stale_revision": "La VPN cambió antes de aplicar esta revisión.",
+    "auth_failed": "La autenticación de la VPN no fue aceptada.",
+    "proposal_failed": "Las propuestas criptográficas no son compatibles con el gateway.",
+    "listener_gate_failed": "Los listeners o la configuración HAProxy no quedaron operativos.",
+    "target_gate_failed": "El destino TCP de la planta no respondió.",
+    "isolation_failed": "Se detectó un cambio fuera de la VPN editada.",
+    "runtime_failed": "La VPN no alcanzó un estado saludable después de aplicar la revisión.",
+    "rollback_failed": "No se pudo completar el rollback automático.",
+}
+
+
+def active_edit_public_reason(code: str) -> str:
+    return _ACTIVE_EDIT_PUBLIC_REASONS.get(
+        str(code or ""),
+        "La revisión no superó una comprobación operativa.",
+    )
+
 
 @dataclass(frozen=True)
 class ActiveEditHooks:
@@ -371,10 +391,13 @@ def run_active_edit(
             rollback_ok = False
         state = "rolled_back" if rollback_ok else "rollback_failed"
         code = failure_code if rollback_ok else "rollback_failed"
+        reason = active_edit_public_reason(code)
         message = (
-            "La nueva revisión falló y se revirtió automáticamente."
+            "La nueva revisión falló y se revirtió automáticamente. "
+            f"Motivo: {reason}"
             if rollback_ok
-            else "La revisión falló y el rollback automático no terminó; requiere intervención administrativa."
+            else "La revisión falló y el rollback automático no terminó; "
+            f"requiere intervención administrativa. Motivo: {reason}"
         )
         try:
             _update_backup(conn, backup_id, state, now, code, failure_detail)
