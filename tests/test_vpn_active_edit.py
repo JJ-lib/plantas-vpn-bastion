@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "panel-app"))
 
 from vpn_active_edit import (
     ActiveEditHooks,
+    active_edit_failure_code,
     ensure_active_edit_schema,
     load_active_edit_snapshot,
     run_active_edit,
@@ -320,6 +321,24 @@ class ActiveVpnEditTests(unittest.TestCase):
         self.assertIn("Motivo:", result.message)
         self.assertIn("destino TCP", result.message)
         self.assertNotIn("target gate failed", result.message)
+
+    def test_runtime_error_details_map_to_predefined_failure_codes(self):
+        self.assertEqual(
+            active_edit_failure_code("XAuth authentication failed"),
+            "auth_failed",
+        )
+        self.assertEqual(
+            active_edit_failure_code("no acceptable proposal"),
+            "proposal_failed",
+        )
+        self.assertEqual(
+            active_edit_failure_code("target connection failed"),
+            "target_gate_failed",
+        )
+        self.assertEqual(
+            active_edit_failure_code("HAProxy listener failed"),
+            "listener_gate_failed",
+        )
 
 
 if __name__ == "__main__":

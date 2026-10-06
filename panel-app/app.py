@@ -9,7 +9,7 @@ from flask import Flask,g,request,redirect,session,flash,abort,get_flashed_messa
 from werkzeug.security import generate_password_hash,check_password_hash
 from cryptography.fernet import Fernet
 from vpn_onboarding import ensure_onboarding_schema,stage_profiles,load_stage,consume_stage
-from vpn_active_edit import ActiveEditError,ActiveEditHooks,ensure_active_edit_schema,run_active_edit
+from vpn_active_edit import ActiveEditError,ActiveEditHooks,active_edit_failure_code,active_edit_public_reason,ensure_active_edit_schema,run_active_edit
 from vpn_endpoint_health import apply_probe_result, ensure_endpoint_health_schema, health_for_vpns, history_intervals, configure_sqlite_connection, public_alert_eligible, StaleRevisionError, StaleCycleError, target_revision, validate_result
 from forticlient_import import parse_forticlient_backup,FortiClientProfileError,MAX_FORTICLIENT_BYTES
 from vpn_runtime import runtime_image,proposal_rows,expand_ike_proposals,remote_subnets
@@ -1426,8 +1426,10 @@ def _active_edit_service_state(name):
     return running.lower()=='true',health.lower()
 
 def _active_edit_verify_runtime(candidate,baseline):
-    online,_,_=wait_vpn_runtime(candidate,timeout=int(os.environ.get('ACTIVE_EDIT_RUNTIME_TIMEOUT','24')))
-    if not online:raise ActiveEditError('runtime_failed','La VPN no alcanzó un estado saludable.')
+    online,_,runtime_error=wait_vpn_runtime(candidate,timeout=int(os.environ.get('ACTIVE_EDIT_RUNTIME_TIMEOUT','24')))
+    if not online:
+        code=active_edit_failure_code(runtime_error)
+        raise ActiveEditError(code,active_edit_public_reason(code))
     slug=str(candidate['slug']);running,health=_active_edit_service_state('vpn-'+slug)
     if not running or health in {'unhealthy','starting'}:raise ActiveEditError('runtime_failed','El contenedor VPN no está saludable.')
     expected=_active_edit_expected_ports(str(candidate['plant']));bound=_active_edit_port_bindings(slug)

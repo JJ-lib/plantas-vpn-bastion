@@ -266,21 +266,25 @@ def _update_backup(conn, backup_id, state, now, failure_code="", failure_detail=
     conn.commit()
 
 
-def _failure_code(exc, phase):
-    if isinstance(exc, ActiveEditError):
-        return exc.code
-    text = str(exc or "").lower()
+def active_edit_failure_code(detail: str, phase: str = "runtime") -> str:
+    text = str(detail or "").lower()
     if phase == "preflight":
         return "candidate_invalid"
     if "target" in text or "conect" in text:
         return "target_gate_failed"
-    if "auth" in text or "cred" in text:
+    if "auth" in text or "cred" in text or "xauth" in text:
         return "auth_failed"
     if "proposal" in text or "propuesta" in text:
         return "proposal_failed"
     if "listener" in text or "haproxy" in text:
         return "listener_gate_failed"
     return "runtime_failed"
+
+
+def _failure_code(exc, phase):
+    if isinstance(exc, ActiveEditError):
+        return exc.code
+    return active_edit_failure_code(str(exc or ""), phase)
 
 
 def _safe_failure_detail(exc):
