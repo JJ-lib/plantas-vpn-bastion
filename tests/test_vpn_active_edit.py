@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "panel-app"))
@@ -300,6 +301,72 @@ class ActiveVpnEditTests(unittest.TestCase):
             0,
         )
 
+    def test_force_apply_keeps_candidate_after_runtime_failure(self):
+        old = {"id": 1, "slug": "demo", "onboarding_revision": 4}
+        candidate = {**old, "onboarding_revision": 5}
+        hooks, calls = self.hooks(verify_error="runtime failed")
+        marks = []
+        hooks = replace(
+            hooks,
+            mark_applied_unhealthy=lambda row, code, detail: marks.append(
+                (row["onboarding_revision"], code)
+            ),
+        )
+
+        result = run_active_edit(
+            self.conn,
+            old,
+            candidate,
+            self.base,
+            hooks,
+            seal=self.seal,
+            unseal=self.unseal,
+            now=1000,
+            rollback_on_failure=False,
+        )
+
+        self.assertEqual(result.state, "applied_unhealthy")
+        self.assertEqual(result.code, "runtime_failed")
+        self.assertEqual(marks, [(5, "runtime_failed")])
+        self.assertIn("permanece activa", result.message)
+        self.assertEqual(self.row()["onboarding_revision"], 5)
+        self.assertEqual((self.base / "configs/demo/ipsec.conf").read_text(), "new-conf")
+        self.assertNotIn("restore_db", calls)
+        self.assertNotIn("restore_runtime", calls)
+        state = self.conn.execute(
+            "SELECT state,failure_code FROM vpn_active_edit_revisions WHERE id=?",
+            (result.backup_id,),
+        ).fetchone()
+        self.assertEqual(tuple(state), ("applied_unhealthy", "runtime_failed"))
+
+    def test_force_apply_rolls_back_if_finalize_fails_after_healthy_gate(self):
+        old = {"id": 1, "slug": "demo", "onboarding_revision": 4}
+        candidate = {**old, "onboarding_revision": 5}
+        hooks, calls = self.hooks()
+
+        def fail_finalize(conn, row, backup_id):
+            calls.append("finalize")
+            raise RuntimeError("finalize failed")
+
+        hooks = replace(hooks, finalize_candidate=fail_finalize)
+        result = run_active_edit(
+            self.conn,
+            old,
+            candidate,
+            self.base,
+            hooks,
+            seal=self.seal,
+            unseal=self.unseal,
+            now=1000,
+            rollback_on_failure=False,
+        )
+
+        self.assertEqual(result.state, "rolled_back")
+        self.assertEqual(self.row()["onboarding_revision"], 4)
+        self.assertEqual((self.base / "configs/demo/ipsec.conf").read_text(), "old-conf")
+        self.assertIn("restore_db", calls)
+        self.assertIn("restore_runtime", calls)
+
     def test_failed_gate_exposes_safe_predefined_reason(self):
         old = {"id": 1, "slug": "demo", "onboarding_revision": 4}
         candidate = {**old, "onboarding_revision": 5}
@@ -338,6 +405,14 @@ class ActiveVpnEditTests(unittest.TestCase):
         self.assertEqual(
             active_edit_failure_code("HAProxy listener failed"),
             "listener_gate_failed",
+        )
+        self.assertEqual(
+            active_edit_failure_code("La negociación VPN no terminó dentro del tiempo de espera."),
+            "runtime_timeout",
+        )
+        self.assertEqual(
+            active_edit_failure_code("Contenedor no creado."),
+            "runtime_container_failed",
         )
 
 

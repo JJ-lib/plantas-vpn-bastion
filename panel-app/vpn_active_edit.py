@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping
 from plant_paths import plant_artifact_dir
 
 
-ACTIVE_EDIT_STATES = {"applying", "confirmed", "rolled_back", "rollback_failed"}
+ACTIVE_EDIT_STATES = {"applying", "confirmed", "applied_unhealthy", "rolled_back", "rollback_failed"}
 _MAX_FILE_BYTES = 8 * 1024 * 1024
 _MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
 
@@ -28,6 +28,9 @@ _ACTIVE_EDIT_PUBLIC_REASONS = {
     "target_gate_failed": "El destino TCP de la planta no respondió.",
     "isolation_failed": "Se detectó un cambio fuera de la VPN editada.",
     "runtime_failed": "La VPN no alcanzó un estado saludable después de aplicar la revisión.",
+    "runtime_timeout": "La negociación de la VPN no terminó dentro del tiempo de espera.",
+    "runtime_container_failed": "El contenedor de la VPN no quedó operativo con la nueva configuración.",
+    "applied_state_record_failed": "La configuración se aplicó, pero el estado requiere intervención administrativa.",
     "rollback_failed": "No se pudo completar el rollback automático.",
 }
 
@@ -49,6 +52,7 @@ class ActiveEditHooks:
     restore_database: Callable[[Any, Mapping[str, Any]], None]
     restore_runtime: Callable[[Mapping[str, Any]], None]
     finalize_candidate: Callable[[Any, Mapping[str, Any], int], None]
+    mark_applied_unhealthy: Callable[[Any, str, str], None] = lambda candidate, code, detail: None
     cleanup_candidate: Callable[[Any], None] = lambda artifact: None
 
 
@@ -270,6 +274,10 @@ def active_edit_failure_code(detail: str, phase: str = "runtime") -> str:
     text = str(detail or "").lower()
     if phase == "preflight":
         return "candidate_invalid"
+    if "tiempo de espera" in text or "timed out" in text or "timeout" in text:
+        return "runtime_timeout"
+    if "contenedor no creado" in text or "contenedor de la vpn" in text or "vpn pausada" in text:
+        return "runtime_container_failed"
     if "target" in text or "conect" in text:
         return "target_gate_failed"
     if "auth" in text or "cred" in text or "xauth" in text:
@@ -304,6 +312,7 @@ def run_active_edit(
     seal: Callable[[str], str],
     unseal: Callable[[str], str],
     now=None,
+    rollback_on_failure: bool = True,
 ) -> ActiveEditResult:
     now = int(time.time() if now is None else now)
     base = Path(base).resolve()
@@ -357,12 +366,16 @@ def run_active_edit(
 
     persisted = False
     runtime_started = False
+    apply_completed = False
+    health_check_completed = False
     try:
         hooks.persist_candidate(conn, candidate)
         persisted = True
         runtime_started = True
         hooks.apply_candidate(artifact)
+        apply_completed = True
         hooks.verify_candidate(candidate, artifact)
+        health_check_completed = True
         hooks.finalize_candidate(conn, candidate, backup_id)
         _update_backup(conn, backup_id, "confirmed", now)
         result = ActiveEditResult(
@@ -380,33 +393,49 @@ def run_active_edit(
     except Exception as failure:
         failure_code = _failure_code(failure, "runtime")
         failure_detail = _safe_failure_detail(failure)
-        rollback_ok = True
-        try:
-            if persisted:
-                hooks.restore_database(conn, old)
-        except Exception:
-            rollback_ok = False
-        try:
-            if runtime_started:
-                snapshot = load_active_edit_snapshot(conn, backup_id, unseal)
-                restore_active_edit_snapshot(base, snapshot)
-                hooks.restore_runtime(old)
-        except Exception:
-            rollback_ok = False
-        state = "rolled_back" if rollback_ok else "rollback_failed"
-        code = failure_code if rollback_ok else "rollback_failed"
-        reason = active_edit_public_reason(code)
-        message = (
-            "La nueva revisión falló y se revirtió automáticamente. "
-            f"Motivo: {reason}"
-            if rollback_ok
-            else "La revisión falló y el rollback automático no terminó; "
-            f"requiere intervención administrativa. Motivo: {reason}"
-        )
-        try:
-            _update_backup(conn, backup_id, state, now, code, failure_detail)
-        except Exception:
-            pass
+        if not rollback_on_failure and apply_completed and not health_check_completed:
+            state = "applied_unhealthy"
+            code = failure_code
+            try:
+                hooks.mark_applied_unhealthy(candidate, code, failure_detail)
+            except Exception:
+                code = "applied_state_record_failed"
+            message = (
+                "La nueva revisión se aplicó y permanece activa, pero la VPN no alcanzó "
+                f"un estado saludable. Motivo: {active_edit_public_reason(code)}"
+            )
+            try:
+                _update_backup(conn, backup_id, state, now, code, failure_detail)
+            except Exception:
+                pass
+        else:
+            rollback_ok = True
+            try:
+                if persisted:
+                    hooks.restore_database(conn, old)
+            except Exception:
+                rollback_ok = False
+            try:
+                if runtime_started:
+                    snapshot = load_active_edit_snapshot(conn, backup_id, unseal)
+                    restore_active_edit_snapshot(base, snapshot)
+                    hooks.restore_runtime(old)
+            except Exception:
+                rollback_ok = False
+            state = "rolled_back" if rollback_ok else "rollback_failed"
+            code = failure_code if rollback_ok else "rollback_failed"
+            reason = active_edit_public_reason(code)
+            message = (
+                "La nueva revisión falló y se revirtió automáticamente. "
+                f"Motivo: {reason}"
+                if rollback_ok
+                else "La revisión falló y el rollback automático no terminó; "
+                f"requiere intervención administrativa. Motivo: {reason}"
+            )
+            try:
+                _update_backup(conn, backup_id, state, now, code, failure_detail)
+            except Exception:
+                pass
         result = ActiveEditResult(
             state,
             code,

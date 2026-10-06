@@ -941,7 +941,7 @@ def vpns():
             actions+=f"<form method=post action=/admin/vpns/{v['id']}/pause style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn danger' onclick='return confirm(&quot;¿Pausar el contenedor Docker de esta VPN? Se interrumpirán sus accesos WEB/RDP.&quot;)'>Pausar VPN</button></form>"
         elif v['onboarding_state']=='verified_pending_activation':actions+=f"<form method=post action=/admin/vpns/{v['id']}/activate style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class='btn primary'>Activar tras revalidar</button></form>"
         actions+=f"<form method=post action=/admin/vpns/{v['id']}/delete style='display:inline'><input type=hidden name=_csrf value='{h(csrf_token())}'><button class=btn onclick='return confirm(&quot;Eliminar VPN, equipos, permisos, configuración y contenedor asociados?&quot;)'>Eliminar VPN</button></form>"
-        normalized_runtime_detail='Online' if online else ('Pausada' if status=='Pausada' else 'VPN no disponible')
+        normalized_runtime_detail='Online' if online else ('Pausada' if status=='Pausada' else (v['validation_detail'] if v['validation_code']=='active_edit_applied_unhealthy' and v['validation_detail'] else 'VPN no disponible'))
         display_detail = detail if not active else normalized_runtime_detail
         b+=f"<tr><td>{h(v['plant'])}</td><td>{h(profile)}</td><td>{h(v['host'])}:{h(v['port'] or '')}</td><td title='{h(normalized_runtime_detail)}'>{icon} {h(status)}<br><span class='muted'>{h(display_detail)}</span></td><td>{endpoint_health_admin_markup(health_by_id.get(int(v['id'])))}</td><td class=url>{h(ip or '-')}</td><td>{actions}</td></tr>"
     b+='</table><p class=muted>Los borradores se validan de forma aislada. Solo pasan a activos tras validar control, datos, rutas y destino interno.</p>';return page('VPNs',b)
@@ -1431,7 +1431,7 @@ def _active_edit_verify_runtime(candidate,baseline):
         code=active_edit_failure_code(runtime_error)
         raise ActiveEditError(code,active_edit_public_reason(code))
     slug=str(candidate['slug']);running,health=_active_edit_service_state('vpn-'+slug)
-    if not running or health in {'unhealthy','starting'}:raise ActiveEditError('runtime_failed','El contenedor VPN no está saludable.')
+    if not running or health in {'unhealthy','starting'}:raise ActiveEditError('runtime_container_failed','El contenedor VPN no está saludable.')
     expected=_active_edit_expected_ports(str(candidate['plant']));bound=_active_edit_port_bindings(slug)
     if not set(expected).issubset(bound):raise ActiveEditError('listener_gate_failed','No están disponibles todos los listeners publicados.')
     expected_haproxy=_active_edit_expected_haproxy_ports(str(candidate['plant']));actual_haproxy=_active_edit_haproxy_bindings(slug)
@@ -1475,6 +1475,19 @@ def _active_edit_restore_database(conn,old):
     if not pairs:raise ActiveEditError('rollback_failed','No hay columnas para restaurar la VPN.')
     assignments=','.join(key+'=?' for key,_ in pairs);conn.execute('UPDATE vpns SET '+assignments+' WHERE id=?',[value for _,value in pairs]+[int(old['id'])]);conn.commit()
 
+def _active_edit_mark_applied_unhealthy(candidate,code,_detail):
+    conn=db()
+    reason=active_edit_public_reason(code)
+    cursor=conn.execute("""UPDATE vpns SET active=1,onboarding_state='active',validation_stage='runtime',
+        validation_code='active_edit_applied_unhealthy',
+        validation_detail=?,last_checked_at=?,next_retry_at=NULL,retry_count=0
+        WHERE id=? AND onboarding_revision=?""",(
+            'Edición activa aplicada, pero la VPN no superó el chequeo de salud. Motivo: '+reason,
+            int(time.time()),int(candidate['id']),int(candidate['onboarding_revision']),
+        ))
+    if cursor.rowcount!=1:raise ActiveEditError('stale_revision','La revisión cambió antes de registrar su estado.')
+    conn.commit()
+
 def _active_edit_finalize_candidate(conn,candidate,backup_id):
     cursor=conn.execute("""UPDATE vpns SET active=1,onboarding_state='active',validation_stage='runtime',
         validation_code='active_edit_confirmed',validation_detail='Edición activa confirmada tras superar todos los gates.',
@@ -1494,8 +1507,8 @@ def _apply_active_vpn_edit(old,vals):
         online,_,_=wait_vpn_runtime(row,timeout=int(os.environ.get('ACTIVE_EDIT_ROLLBACK_TIMEOUT','24')))
         if not online:raise ActiveEditError('rollback_failed','La VPN anterior no recuperó un estado saludable tras el rollback.')
         _active_edit_assert_container_baseline(baseline,row['slug'])
-    hooks=ActiveEditHooks(stage_candidate=_active_edit_stage_candidate,validate_candidate=_active_edit_validate_candidate,persist_candidate=_active_edit_persist_candidate,apply_candidate=apply_candidate,verify_candidate=lambda row,artifact:_active_edit_verify_runtime(row,baseline),restore_database=_active_edit_restore_database,restore_runtime=restore_runtime,finalize_candidate=_active_edit_finalize_candidate,cleanup_candidate=_active_edit_cleanup_candidate)
-    return run_active_edit(db(),old,candidate,BASE,hooks,seal=enc,unseal=dec)
+    hooks=ActiveEditHooks(stage_candidate=_active_edit_stage_candidate,validate_candidate=_active_edit_validate_candidate,persist_candidate=_active_edit_persist_candidate,apply_candidate=apply_candidate,verify_candidate=lambda row,artifact:_active_edit_verify_runtime(row,baseline),restore_database=_active_edit_restore_database,restore_runtime=restore_runtime,finalize_candidate=_active_edit_finalize_candidate,mark_applied_unhealthy=_active_edit_mark_applied_unhealthy,cleanup_candidate=_active_edit_cleanup_candidate)
+    return run_active_edit(db(),old,candidate,BASE,hooks,seal=enc,unseal=dec,rollback_on_failure=False)
 
 @app.route('/admin/vpns/<int:i>/edit',methods=['GET','POST'])
 @admin
@@ -1520,8 +1533,11 @@ def vpn_edit(i):
                 return page('Editar VPN '+kind.upper(),vf(v,kind,getattr(e,'public_message',str(e)))),409
             except (ValueError,sqlite3.IntegrityError) as e:
                 return page('Editar VPN '+kind.upper(),vf(v,kind,str(e))),400
-            if result.state=='confirmed':
-                flash('Edición aplicada y confirmada tras superar validación, salud, listeners, HAProxy y conectividad.')
+            if result.state in {'confirmed','applied_unhealthy'}:
+                if result.state=='confirmed':
+                    flash('Edición aplicada y confirmada tras superar validación, salud, listeners, HAProxy y conectividad.')
+                else:
+                    flash(result.message)
                 return redirect('/admin/vpns')
             status=500 if result.state=='rollback_failed' else 409
             return page('Editar VPN '+kind.upper(),vf(v,kind,result.message)),status
